@@ -434,14 +434,17 @@ def verify_opencode_output(inv: Invocation, stdout: bytes, timeout: float) -> tu
         return b"", None, None, _opencode_failure("missing_or_ambiguous_session_id")
     session_id = next(iter(session_ids))
     try:
-        exported = subprocess.run(
-            [inv.argv[0], "export", session_id],
-            env=dict(inv.env),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
+        with tempfile.TemporaryFile() as export_stdout:
+            exported = subprocess.run(
+                [inv.argv[0], "export", session_id],
+                env=dict(inv.env),
+                stdout=export_stdout,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+            export_stdout.seek(0)
+            export_data = export_stdout.read()
     except subprocess.TimeoutExpired:
         return b"", session_id, None, _opencode_failure("export_timeout")
     except (FileNotFoundError, OSError) as e:
@@ -449,7 +452,7 @@ def verify_opencode_output(inv: Invocation, stdout: bytes, timeout: float) -> tu
     if exported.returncode != 0:
         return b"", session_id, None, _opencode_failure(f"export_exit:{exported.returncode}")
     try:
-        record = json.loads(exported.stdout.decode("utf-8", "replace"))
+        record = json.loads(export_data.decode("utf-8", "replace"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return b"", session_id, None, _opencode_failure("invalid_export_json")
     info = record.get("info") if isinstance(record, dict) else None
