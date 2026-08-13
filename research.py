@@ -16,6 +16,7 @@ BACKENDS = {"opencode", "cursor"}
 OPENCODE_AGENT = "deep-research-worker"
 OPENCODE_DENY = {"edit": "deny", "bash": "deny", "external_directory": "deny", "task": "deny"}
 OPENCODE_ALLOW = {"list": "allow", "glob": "allow", "grep": "allow", "webfetch": "allow", "websearch": "allow"}
+OPENCODE_READ = {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"}
 
 
 class RunnerFatal(RuntimeError): pass
@@ -172,6 +173,23 @@ def extract_object(text: str) -> Any:
 def parse_stdout(data: bytes) -> list[dict[str, Any]]: return validate_findings(extract_object(data.decode("utf-8", "replace")))
 
 
+def opencode_research_permissions(global_permission: Any, agent_permission: Any) -> dict[str, Any]:
+    safe: dict[str, Any] = {"*": "deny", "read": copy.deepcopy(OPENCODE_READ), **OPENCODE_ALLOW, **OPENCODE_DENY}
+    for source in (global_permission, agent_permission):
+        if source == "deny":
+            for key in ("read", *OPENCODE_ALLOW): safe[key] = "deny"
+            continue
+        if not isinstance(source, dict): continue
+        for key in ("read", *OPENCODE_ALLOW):
+            value = source.get(key)
+            if value == "deny":
+                safe[key] = "deny"
+            elif key == "read" and isinstance(value, dict) and isinstance(safe["read"], dict):
+                for pattern, action in value.items():
+                    if action == "deny": safe["read"][pattern] = "deny"
+    return safe
+
+
 def opencode_config(existing: str | None) -> str:
     if existing:
         try: cfg = json.loads(existing)
@@ -179,16 +197,14 @@ def opencode_config(existing: str | None) -> str:
         if not isinstance(cfg, dict): raise RunnerFatal("OPENCODE_CONFIG_CONTENT must be an object")
         cfg = copy.deepcopy(cfg)
     else: cfg = {}
-    perms = cfg.get("permission") if isinstance(cfg.get("permission"), dict) else {}
-    perms = copy.deepcopy(perms)
+    global_permission = cfg.get("permission")
+    perms = copy.deepcopy(global_permission) if isinstance(global_permission, dict) else {}
     for key, value in OPENCODE_ALLOW.items(): perms.setdefault(key, value)
     perms.update(OPENCODE_DENY); cfg["permission"] = perms
     agents = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}; agents = copy.deepcopy(agents)
     agent = agents.get(OPENCODE_AGENT) if isinstance(agents.get(OPENCODE_AGENT), dict) else {}; agent = copy.deepcopy(agent)
-    aperms = agent.get("permission") if isinstance(agent.get("permission"), dict) else {}; aperms = copy.deepcopy(aperms)
-    for key, value in OPENCODE_ALLOW.items(): aperms.setdefault(key, value)
-    aperms.update(OPENCODE_DENY)
-    agent.update({"mode": "primary", "permission": aperms})
+    agent_permission = agent.get("permission")
+    agent.update({"mode": "primary", "permission": opencode_research_permissions(global_permission, agent_permission)})
     agents[OPENCODE_AGENT] = agent; cfg["agent"] = agents
     return json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
