@@ -31,8 +31,6 @@ SECRET_KEY_RE = re.compile(
     r"refresh[_-]?token|session|cookie|signature|headers?)",
     re.IGNORECASE,
 )
-NON_SECRET_AUTH_KEYS = {"oauth", "oauthenabled"}
-
 
 class RunnerFatal(RuntimeError): pass
 class ValidationError(ValueError): pass
@@ -218,7 +216,6 @@ def opencode_research_permissions(global_permission: Any, agent_permission: Any)
     safe.update(OPENCODE_WEB_ALLOW)
     return safe
 
-
 def opencode_config(existing: str | None) -> str:
     if existing:
         try: cfg = json.loads(existing)
@@ -250,26 +247,83 @@ def opencode_config(existing: str | None) -> str:
     return json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def scrub_config(value: Any) -> Any:
-    """Copy JSON config while visibly redacting values under secret-ish keys."""
+def _audit_permission(value: Any) -> dict[str, Any] | str | None:
+    """Keep only permission entries needed to audit the research sandbox."""
+    if value == "deny":
+        return "deny"
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("*", *OPENCODE_ALLOW, *OPENCODE_WEB_ALLOW, *EXA_MCP_TOOLS, *OPENCODE_DENY):
+        action = value.get(key)
+        if isinstance(action, str):
+            out[key] = action
+    read = value.get("read")
+    if isinstance(read, str):
+        out["read"] = read
+    elif isinstance(read, dict):
+        read_audit = {
+            pattern: read[pattern]
+            for pattern in OPENCODE_READ
+            if isinstance(read.get(pattern), str)
+        }
+        if read_audit:
+            out["read"] = read_audit
+    return out
+
+
+def _redact_all_values(value: Any) -> Any:
+    """Preserve provider shape for diagnostics without persisting any provider values."""
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]"
-            if SECRET_KEY_RE.search(key) and key.replace("_", "").replace("-", "").lower() not in NON_SECRET_AUTH_KEYS
-            else scrub_config(item)
+            str(key): "[REDACTED]" if SECRET_KEY_RE.search(str(key)) else _redact_all_values(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [scrub_config(item) for item in value]
-    return value
+        return [_redact_all_values(item) for item in value]
+    return "[REDACTED]"
 
 
 def scrub_opencode_config(content: str) -> str:
+    """Persist a closed audit projection instead of the complete host OpenCode config."""
     try:
-        value = json.loads(content)
+        cfg = json.loads(content)
     except json.JSONDecodeError as e:
         raise RunnerFatal(f"persisted OPENCODE_CONFIG_CONTENT invalid: {e}") from e
-    return json.dumps(scrub_config(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if not isinstance(cfg, dict):
+        raise RunnerFatal("persisted OPENCODE_CONFIG_CONTENT must be an object")
+
+    agents = cfg.get("agent")
+    agent = agents.get(OPENCODE_AGENT) if isinstance(agents, dict) else None
+    mcp = cfg.get("mcp")
+    exa = mcp.get(EXA_MCP_NAME) if isinstance(mcp, dict) else None
+
+    audit: dict[str, Any] = {
+        "permission": _audit_permission(cfg.get("permission")),
+        "mcp": {},
+        "agent": {},
+        "model": cfg.get("model") if isinstance(cfg.get("model"), str) else None,
+    }
+    if isinstance(exa, dict):
+        audit["mcp"][EXA_MCP_NAME] = {
+            key: copy.deepcopy(exa[key])
+            for key in ("type", "url", "enabled", "oauth", "codemode")
+            if key in exa
+        }
+    if isinstance(agent, dict):
+        selected = {
+            "mode": agent.get("mode"),
+            "permission": _audit_permission(agent.get("permission")),
+        }
+        if isinstance(agent.get("model"), str):
+            selected["model"] = agent["model"]
+        audit["agent"][OPENCODE_AGENT] = selected
+
+    provider = cfg.get("provider")
+    if isinstance(provider, dict):
+        audit["provider"] = _redact_all_values(provider)
+
+    return json.dumps(audit, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def build_invocation(
@@ -438,6 +492,7 @@ def subprocess_executor(inv: Invocation, timeout: float) -> InvocationResult:
 def raw_value(attempt: Mapping[str, Any], invocation: Invocation, result: InvocationResult) -> dict[str, Any]:
     config = invocation.env.get("OPENCODE_CONFIG_CONTENT") if invocation.backend == "opencode" else None
     captured_stdout = result.raw_stdout if result.raw_stdout is not None else result.stdout
+
     value = {
         "schema": "deep-research-raw-attempt/v2",
         "ordinal": attempt["ordinal"],
@@ -658,6 +713,7 @@ class ResearchRunner:
             elif kind=="primary-format-repair": self.fallback(tid,f"format repair invalid: {err}",backend)
             else: self.fail(tid,f"fallback invalid: {err}")
             return
+
         self.accept(tid,a,findings)
 
     def recover_inflight(self) -> None:
