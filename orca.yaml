@@ -1,0 +1,78 @@
+# Orca worktree hooks for the DeepReserch deep-research runner.
+#
+# research.py is stdlib-only, so there is nothing to install. Setup exists to
+# fail fast on a wrong interpreter, prepare the gitignored run layout, and tell
+# the agent up front which worker CLIs are actually usable in this worktree.
+
+scripts:
+  setup: |
+    set -uo pipefail
+    cd "$ORCA_WORKTREE_PATH"
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+    PY="$(command -v python3 || command -v python || true)"
+    if [ -z "$PY" ]; then
+      echo "FAIL: no python3 on PATH; research.py needs Python 3.11+" >&2
+      exit 1
+    fi
+    if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+      echo "FAIL: $("$PY" -V) is too old; research.py needs Python 3.11+" >&2
+      exit 1
+    fi
+    echo "python: $PY ($("$PY" -V 2>&1))"
+
+    # runs/** is gitignored and never arrives with the worktree.
+    mkdir -p runs
+
+    # Worker CLIs are the only external dependency. Missing ones are a warning,
+    # not a failure: unit tests and manager-side planning work without them.
+    for cli in cursor-agent opencode; do
+      if command -v "$cli" >/dev/null 2>&1; then
+        echo "worker cli: $cli -> $(command -v "$cli")"
+      else
+        echo "WARN: worker cli '$cli' not on PATH; --backend $cli will not run here" >&2
+      fi
+    done
+
+    # Readiness gate. Non-fatal so a broken branch still opens for debugging.
+    # PYTHONDONTWRITEBYTECODE keeps __pycache__ out of the fresh worktree —
+    # it is not gitignored, and a dirty tree breaks the runner's own
+    # "repository status unchanged" smoke criterion.
+    if PYTHONDONTWRITEBYTECODE=1 "$PY" -m unittest -q tests.test_research; then
+      echo "unit tests: PASS"
+    else
+      echo "WARN: tests.test_research failed in this worktree" >&2
+    fi
+
+  archive: |
+    set -uo pipefail
+    cd "$ORCA_WORKTREE_PATH"
+
+    # runs/ is untracked, so archiving the worktree would drop every session's
+    # raw envelopes, results and FINAL_REPORT.md. Preserve them in the root
+    # repo, where runs/** is also gitignored.
+    if [ -d runs ] && [ -n "$(ls -A runs 2>/dev/null)" ]; then
+      dest="$ORCA_ROOT_PATH/runs/_archived/$ORCA_WORKSPACE_NAME"
+      mkdir -p "$dest"
+      cp -a runs/. "$dest"/ && echo "archived research runs -> $dest"
+    else
+      echo "no research runs to preserve"
+    fi
+
+issueCommand: |
+  Work on {{artifact_url}}.
+
+  Read the linked issue or PR in full first, then CLAUDE.md, AGENTS.md, README.md,
+  prompts/manager.md and prompts/worker.md. This repo is architect-first: produce a
+  plan (goal -> context -> options -> recommendation -> risks -> verification plan)
+  and get explicit approval before editing production files.
+
+  Constraints:
+  - stay inside the issue's allowed-roots; never touch claude-pipe/, codex/ or other
+    prior-art/submodule paths;
+  - research.py is stdlib-only — do not add dependencies;
+  - workers stay read-only (Cursor `--mode=ask`, OpenCode deny edit/bash/external_directory/task);
+  - do not re-implement scheduling, retry/fallback, durable state or metrics outside research.py.
+
+  Verify with: python3 -m unittest -v tests.test_research
