@@ -1,4 +1,0 @@
-[submodule "claude-pipe"]
-	path = claude-pipe
-	url = https://github.com/bluzir/claude-pipe.git
-	ignore = untracked
