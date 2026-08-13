@@ -15,7 +15,7 @@ KINDS = {"primary-research", "primary-format-repair", "fallback-research"}
 BACKENDS = {"opencode", "cursor"}
 OPENCODE_AGENT = "deep-research-worker"
 OPENCODE_DENY = {"edit": "deny", "bash": "deny", "external_directory": "deny", "task": "deny"}
-OPENCODE_ALLOW = {"read": "allow", "list": "allow", "glob": "allow", "grep": "allow", "webfetch": "allow", "websearch": "allow"}
+OPENCODE_ALLOW = {"list": "allow", "glob": "allow", "grep": "allow", "webfetch": "allow", "websearch": "allow"}
 
 
 class RunnerFatal(RuntimeError): pass
@@ -73,10 +73,15 @@ def atomic_json(path: Path, value: Any) -> None: atomic_write(path, json_bytes(v
 
 def exclusive_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data); f.flush(); os.fsync(f.fileno())
-    fsync_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.link(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
 
 
 def load_json(path: Path) -> Any:
@@ -175,11 +180,15 @@ def opencode_config(existing: str | None) -> str:
         cfg = copy.deepcopy(cfg)
     else: cfg = {}
     perms = cfg.get("permission") if isinstance(cfg.get("permission"), dict) else {}
-    perms = {**perms, **OPENCODE_ALLOW, **OPENCODE_DENY}; cfg["permission"] = perms
+    perms = copy.deepcopy(perms)
+    for key, value in OPENCODE_ALLOW.items(): perms.setdefault(key, value)
+    perms.update(OPENCODE_DENY); cfg["permission"] = perms
     agents = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}; agents = copy.deepcopy(agents)
     agent = agents.get(OPENCODE_AGENT) if isinstance(agents.get(OPENCODE_AGENT), dict) else {}; agent = copy.deepcopy(agent)
-    aperms = agent.get("permission") if isinstance(agent.get("permission"), dict) else {}
-    agent.update({"mode": "primary", "permission": {**aperms, **OPENCODE_ALLOW, **OPENCODE_DENY}})
+    aperms = agent.get("permission") if isinstance(agent.get("permission"), dict) else {}; aperms = copy.deepcopy(aperms)
+    for key, value in OPENCODE_ALLOW.items(): aperms.setdefault(key, value)
+    aperms.update(OPENCODE_DENY)
+    agent.update({"mode": "primary", "permission": aperms})
     agents[OPENCODE_AGENT] = agent; cfg["agent"] = agents
     return json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -268,7 +277,11 @@ class ResearchRunner:
 
     def mutate(self, fn):
         with self.lock:
-            out = fn(self.state); atomic_json(self.state_path, self.state); return out
+            candidate = copy.deepcopy(self.state)
+            out = fn(candidate)
+            atomic_json(self.state_path, candidate)
+            self.state = candidate
+            return out
 
     def admit(self, plan: Mapping[str, Any]) -> None:
         state = load_json(self.state_path) if self.state_path.exists() else {"schema": "deep-research-state/v1", "session_id": self.session, "tasks": {}}
@@ -297,6 +310,7 @@ class ResearchRunner:
         n = v.get("accepted_attempt_ordinal")
         match = [a for a in ts.get("attempts", []) if isinstance(a, dict) and a.get("ordinal") == n]
         if not isinstance(n, int) or len(match) != 1 or not self.raw_path(tid, n).exists(): return None
+        if ts.get("status") == "completed" and ts.get("accepted_attempt_ordinal") != n: return None
         try: meta, _ = load_raw(self.raw_path(tid, n)); validate_findings({"findings": v.get("findings")})
         except (RunnerFatal, ValidationError): return None
         a = match[0]
@@ -306,7 +320,10 @@ class ResearchRunner:
     def reconcile(self) -> None:
         for tid, ts in list(copy.deepcopy(self.state["tasks"]).items()):
             v = self.result_valid(tid, ts)
-            if v and ts.get("status") != "completed":
+            if ts.get("status") == "completed":
+                if not v: raise RunnerFatal(f"{tid}: completed state has no valid accepted result")
+                continue
+            if v:
                 n = v["accepted_attempt_ordinal"]
                 def f(s, tid=tid, n=n):
                     t=s["tasks"][tid]; t.update(status="completed", accepted_attempt_ordinal=n); t.pop("error", None)
@@ -387,7 +404,10 @@ class ResearchRunner:
             if not ts.get("attempts"): raise RunnerFatal(f"{tid}: in_flight without attempt")
             a=ts["attempts"][-1]; p=self.raw_path(tid,a.get("ordinal",0))
             if not p.exists(): self.fail(tid,"interrupted_unknown: started attempt has no complete raw outcome"); continue
-            meta,r=load_raw(p)
+            try: meta,r=load_raw(p)
+            except RunnerFatal:
+                self.fail(tid,"interrupted_unknown: started attempt has incomplete/unreadable raw outcome")
+                continue
             if any(meta.get(k)!=a.get(k) for k in ("ordinal","kind","backend")): raise RunnerFatal(f"{tid}: raw/state attempt mismatch")
             self.handle(tid,a,r)
 
