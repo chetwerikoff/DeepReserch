@@ -25,6 +25,13 @@ OPENCODE_ALLOW = {
 }
 OPENCODE_WEB_ALLOW = {"webfetch": "allow", "websearch": "allow"}
 OPENCODE_READ = {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"}
+SECRET_KEY_RE = re.compile(
+    r"(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|credential|"
+    r"authorization|authentication|auth|bearer|private[_-]?key|client[_-]?secret|"
+    r"refresh[_-]?token|session|cookie|signature|headers?)",
+    re.IGNORECASE,
+)
+NON_SECRET_AUTH_KEYS = {"oauth", "oauthenabled"}
 
 
 class RunnerFatal(RuntimeError): pass
@@ -37,6 +44,7 @@ class Invocation:
     argv: tuple[str, ...]
     env: Mapping[str, str]
     prompt: str
+    cursor_mcp_json: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,10 @@ class InvocationResult:
     stderr: bytes
     exit_code: int | None
     timed_out: bool = False
+    verification_error: str | None = None
+    raw_stdout: bytes | None = None
+    opencode_session_id: str | None = None
+    opencode_agent: str | None = None
 
 
 Executor = Callable[[Invocation, float], InvocationResult]
@@ -238,6 +250,28 @@ def opencode_config(existing: str | None) -> str:
     return json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def scrub_config(value: Any) -> Any:
+    """Copy JSON config while visibly redacting values under secret-ish keys."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]"
+            if SECRET_KEY_RE.search(key) and key.replace("_", "").replace("-", "").lower() not in NON_SECRET_AUTH_KEYS
+            else scrub_config(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [scrub_config(item) for item in value]
+    return value
+
+
+def scrub_opencode_config(content: str) -> str:
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise RunnerFatal(f"persisted OPENCODE_CONFIG_CONTENT invalid: {e}") from e
+    return json.dumps(scrub_config(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def build_invocation(
     backend: str,
     prompt: str,
@@ -248,52 +282,208 @@ def build_invocation(
     cursor_workspace: Path | None = None,
 ) -> Invocation:
     env = dict(os.environ if base_env is None else base_env)
+    cursor_mcp_json = None
     if backend == "cursor":
         argv = [cursor_command, "--print", "--mode=ask", "--output-format", "text", "--approve-mcps"]
         if cursor_workspace is not None:
             workspace = Path(cursor_workspace).resolve(strict=False)
+            cursor_mcp_json = {"mcpServers": {EXA_MCP_NAME: {"url": EXA_MCP_URL}}}
             atomic_json(
                 safe_path(workspace, ".cursor", "mcp.json"),
-                {"mcpServers": {EXA_MCP_NAME: {"url": EXA_MCP_URL}}},
+                cursor_mcp_json,
             )
             argv += ["--workspace", str(workspace)]
         if model: argv += ["--model", model]
         argv.append(prompt)
     elif backend == "opencode":
         env["OPENCODE_CONFIG_CONTENT"] = opencode_config(env.get("OPENCODE_CONFIG_CONTENT"))
-        argv = [opencode_command, "run", "--agent", OPENCODE_AGENT, "--format", "default"]
+        argv = [opencode_command, "run", "--agent", OPENCODE_AGENT, "--format", "json"]
         if model: argv += ["--model", model]
         argv.append(prompt)
     else: raise RunnerFatal(f"unsupported backend: {backend}")
-    return Invocation(backend, tuple(argv), env, prompt)
+    return Invocation(backend, tuple(argv), env, prompt, cursor_mcp_json)
+
+
+def _opencode_preflight_failure(reason: str) -> str:
+    return f"opencode_safe_mode_preflight_failed:{reason}"
+
+
+def verify_opencode_safe_mode(inv: Invocation, timeout: float) -> str | None:
+    """Resolve OpenCode config before worker launch and fail closed unless the effective agent is research-safe."""
+    try:
+        resolved = subprocess.run(
+            [inv.argv[0], "debug", "config"],
+            env=dict(inv.env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _opencode_preflight_failure("timeout")
+    except (FileNotFoundError, OSError) as e:
+        return _opencode_preflight_failure(f"launch:{type(e).__name__}")
+    if resolved.returncode != 0:
+        return _opencode_preflight_failure(f"exit:{resolved.returncode}")
+    try:
+        cfg = json.loads(resolved.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return _opencode_preflight_failure("invalid_json")
+    if not isinstance(cfg, dict):
+        return _opencode_preflight_failure("non_object_config")
+    global_permission = cfg.get("permission")
+    agents = cfg.get("agent")
+    agent = agents.get(OPENCODE_AGENT) if isinstance(agents, dict) else None
+    agent_permission = agent.get("permission") if isinstance(agent, dict) else None
+    if not isinstance(global_permission, dict):
+        return _opencode_preflight_failure("global_permission_missing")
+    if not isinstance(agent, dict):
+        return _opencode_preflight_failure("agent_missing")
+    if agent.get("mode") != "primary":
+        return _opencode_preflight_failure("agent_mode")
+    if not isinstance(agent_permission, dict):
+        return _opencode_preflight_failure("agent_permission_missing")
+    for key in OPENCODE_DENY:
+        if global_permission.get(key) != "deny":
+            return _opencode_preflight_failure(f"global_permission:{key}")
+        if agent_permission.get(key) != "deny":
+            return _opencode_preflight_failure(f"agent_permission:{key}")
+    mcp = cfg.get("mcp")
+    exa = mcp.get(EXA_MCP_NAME) if isinstance(mcp, dict) else None
+    if not (
+        isinstance(exa, dict)
+        and exa.get("type") == "remote"
+        and exa.get("url") == EXA_MCP_URL
+        and exa.get("enabled") is True
+    ):
+        return _opencode_preflight_failure("exa_mcp")
+    return None
+
+
+def _opencode_failure(reason: str) -> str:
+    return f"opencode_agent_verification_failed:{reason}"
+
+
+def verify_opencode_output(inv: Invocation, stdout: bytes, timeout: float) -> tuple[bytes, str | None, str | None, str | None]:
+    """Verify the selected agent through OpenCode's exported session record."""
+    events = []
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return b"", None, None, _opencode_failure("invalid_json_event")
+        if not isinstance(event, dict):
+            return b"", None, None, _opencode_failure("non_object_event")
+        events.append(event)
+    session_ids = {event.get("sessionID") for event in events if isinstance(event.get("sessionID"), str) and event.get("sessionID")}
+    if len(session_ids) != 1:
+        return b"", None, None, _opencode_failure("missing_or_ambiguous_session_id")
+    session_id = next(iter(session_ids))
+    try:
+        exported = subprocess.run(
+            [inv.argv[0], "export", session_id],
+            env=dict(inv.env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return b"", session_id, None, _opencode_failure("export_timeout")
+    except (FileNotFoundError, OSError) as e:
+        return b"", session_id, None, _opencode_failure(f"export_launch:{type(e).__name__}")
+    if exported.returncode != 0:
+        return b"", session_id, None, _opencode_failure(f"export_exit:{exported.returncode}")
+    try:
+        record = json.loads(exported.stdout.decode("utf-8", "replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return b"", session_id, None, _opencode_failure("invalid_export_json")
+    info = record.get("info") if isinstance(record, dict) else None
+    agent = info.get("agent") if isinstance(info, dict) else None
+    if not isinstance(agent, str) or not agent:
+        return b"", session_id, None, _opencode_failure("export_missing_agent")
+    if agent != OPENCODE_AGENT:
+        return b"", session_id, agent, _opencode_failure(f"unexpected_agent:{agent}")
+    if isinstance(info.get("id"), str) and info["id"] != session_id:
+        return b"", session_id, agent, _opencode_failure("export_session_mismatch")
+    text = b"".join(
+        part.get("text", "").encode("utf-8")
+        for event in events
+        if event.get("type") == "text"
+        for part in [event.get("part")]
+        if isinstance(part, dict) and isinstance(part.get("text"), str)
+    )
+    if not text:
+        return b"", session_id, agent, _opencode_failure("missing_text_event")
+    return text, session_id, agent, None
 
 
 def subprocess_executor(inv: Invocation, timeout: float) -> InvocationResult:
     try:
+        if inv.backend == "opencode":
+            preflight_error = verify_opencode_safe_mode(inv, timeout)
+            if preflight_error:
+                return InvocationResult(b"", b"", 0, False, preflight_error, b"")
         p = subprocess.run(inv.argv, env=dict(inv.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
-        return InvocationResult(p.stdout, p.stderr, p.returncode)
+        if inv.backend == "opencode" and p.returncode == 0:
+            answer, session_id, agent, verification_error = verify_opencode_output(inv, p.stdout, timeout)
+            return InvocationResult(answer, p.stderr, p.returncode, False, verification_error, p.stdout, session_id, agent)
+        return InvocationResult(p.stdout, p.stderr, p.returncode, raw_stdout=p.stdout)
     except subprocess.TimeoutExpired as e:
         def b(v): return v if isinstance(v, bytes) else (v or "").encode()
-        return InvocationResult(b(e.stdout), b(e.stderr), None, True)
+        return InvocationResult(b(e.stdout), b(e.stderr), None, True, raw_stdout=b(e.stdout))
     except (FileNotFoundError, OSError) as e: raise RunnerFatal(f"cannot launch {inv.backend}: {e}") from e
 
 
-def raw_value(attempt: Mapping[str, Any], result: InvocationResult) -> dict[str, Any]:
-    return {"schema": "deep-research-raw-attempt/v1", "ordinal": attempt["ordinal"], "kind": attempt["kind"], "backend": attempt["backend"],
-            "exit_code": result.exit_code, "timed_out": result.timed_out,
-            "stdout_b64": base64.b64encode(result.stdout).decode(), "stderr_b64": base64.b64encode(result.stderr).decode()}
+def raw_value(attempt: Mapping[str, Any], invocation: Invocation, result: InvocationResult) -> dict[str, Any]:
+    config = invocation.env.get("OPENCODE_CONFIG_CONTENT") if invocation.backend == "opencode" else None
+    captured_stdout = result.raw_stdout if result.raw_stdout is not None else result.stdout
+    value = {
+        "schema": "deep-research-raw-attempt/v2",
+        "ordinal": attempt["ordinal"],
+        "kind": attempt["kind"],
+        "backend": attempt["backend"],
+        "argv": list(invocation.argv),
+        "opencode_config_content": scrub_opencode_config(config) if config is not None else None,
+        "cursor_mcp_json": copy.deepcopy(invocation.cursor_mcp_json),
+        "opencode_session_id": result.opencode_session_id if invocation.backend == "opencode" else None,
+        "opencode_agent": result.opencode_agent if invocation.backend == "opencode" else None,
+        "verification_error": result.verification_error,
+        "exit_code": result.exit_code,
+        "timed_out": result.timed_out,
+        "stdout_b64": base64.b64encode(captured_stdout).decode(),
+        "stderr_b64": base64.b64encode(result.stderr).decode(),
+    }
+    if captured_stdout != result.stdout:
+        value["answer_stdout_b64"] = base64.b64encode(result.stdout).decode()
+    return value
 
 
 def load_raw(path: Path) -> tuple[dict[str, Any], InvocationResult]:
     v = load_json(path)
-    if not isinstance(v, dict) or v.get("schema") != "deep-research-raw-attempt/v1" or v.get("kind") not in KINDS or v.get("backend") not in BACKENDS:
+    if not isinstance(v, dict) or v.get("schema") != "deep-research-raw-attempt/v2" or v.get("kind") not in KINDS or v.get("backend") not in BACKENDS:
         raise RunnerFatal(f"invalid raw envelope: {path}")
     if not isinstance(v.get("ordinal"), int) or v["ordinal"] < 1 or not isinstance(v.get("timed_out"), bool): raise RunnerFatal(f"invalid raw metadata: {path}")
+    if (
+        not isinstance(v.get("argv"), list)
+        or not v["argv"]
+        or any(not isinstance(item, str) for item in v["argv"])
+        or (v["backend"] == "opencode" and not isinstance(v.get("opencode_config_content"), str))
+        or (v["backend"] == "cursor" and not isinstance(v.get("cursor_mcp_json"), dict))
+        or (v["backend"] == "opencode" and v.get("cursor_mcp_json") is not None)
+        or (v["backend"] == "cursor" and v.get("opencode_config_content") is not None)
+        or (v.get("verification_error") is not None and not isinstance(v.get("verification_error"), str))
+        or (v.get("opencode_session_id") is not None and not isinstance(v.get("opencode_session_id"), str))
+        or (v.get("opencode_agent") is not None and not isinstance(v.get("opencode_agent"), str))
+    ):
+        raise RunnerFatal(f"invalid raw invocation metadata: {path}")
     try: out, err = base64.b64decode(v["stdout_b64"], validate=True), base64.b64decode(v["stderr_b64"], validate=True)
     except (KeyError, TypeError, ValueError) as e: raise RunnerFatal(f"invalid raw bytes: {path}") from e
+    try: answer = base64.b64decode(v.get("answer_stdout_b64", v["stdout_b64"]), validate=True)
+    except (KeyError, TypeError, ValueError) as e: raise RunnerFatal(f"invalid raw answer bytes: {path}") from e
     code = v.get("exit_code")
     if code is not None and not isinstance(code, int): raise RunnerFatal(f"invalid raw exit code: {path}")
-    return v, InvocationResult(out, err, code, v["timed_out"])
+    return v, InvocationResult(answer, err, code, v["timed_out"], v.get("verification_error"), out, v.get("opencode_session_id"), v.get("opencode_agent"))
 
 
 def task_prompt(contract: str, task: Mapping[str, Any]) -> str:
@@ -439,7 +629,7 @@ class ResearchRunner:
             cursor_workspace=self.root if backend == "cursor" else None,
         )
         a=self.start(tid,kind,backend,model); result=self.executor(inv,self.timeout)
-        try: exclusive_write(self.raw_path(tid,a["ordinal"]), json_bytes(raw_value(a,result)))
+        try: exclusive_write(self.raw_path(tid,a["ordinal"]), json_bytes(raw_value(a,inv,result)))
         except FileExistsError as e: raise RunnerFatal("raw attempt clobber refused") from e
         return a,result
 
@@ -450,6 +640,11 @@ class ResearchRunner:
 
     def handle(self, tid: str, a: Mapping[str,Any], r: InvocationResult) -> None:
         kind,n,backend=a["kind"],a["ordinal"],a["backend"]
+        if r.verification_error:
+            self.phase(tid,n,"verification_error",r.verification_error)
+            if kind == "fallback-research": self.fail(tid, f"fallback {r.verification_error}")
+            else: self.fallback(tid, f"{kind} {r.verification_error}", backend)
+            return
         if r.timed_out or r.exit_code != 0:
             reason="timeout" if r.timed_out else f"process exit {r.exit_code}"; self.phase(tid,n,"process_error",reason)
             if kind=="fallback-research": self.fail(tid,f"fallback {reason}")
