@@ -10,7 +10,7 @@ Use the candidate-discovery workflow only when the candidate or solution univers
 
 A closed-set request such as “compare A and B and recommend one” stays a direct comparison/research task. Do not manufacture candidate classes or broad discovery unless the user explicitly asks to find alternatives, broaden the set, or discover the surrounding solution space.
 
-Before any execution, choose practical bounds appropriate to the request: task/follow-up budget, concurrency, per-task timeout, and, only where the selected backend can honor them, iteration/tool-call guidance. Use the runner's existing `--max-workers` and `--timeout` controls. Do not pretend there is portable mechanical enforcement for worker iteration/tool-call counts. If a bound is exhausted, synthesize accepted evidence already collected and disclose the limitation instead of silently continuing.
+Before the first `research.py run`, choose and record concrete practical bounds in the manager-owned `runs/<session>/plan.json`: total task budget, follow-up task budget, concurrency, per-task timeout, and, only where the selected backend can honor them, iteration/tool-call guidance. The first execution must use the recorded `max_workers` and `per_task_timeout_seconds` values via the runner's existing `--max-workers` and `--timeout` controls. If the selected backend cannot portably honor iteration/tool-call guidance, record `backend_guidance` as `null` rather than a placeholder. Do not start execution until these bounds are durable. Do not silently increase them later in the run. If a bound is exhausted, synthesize accepted evidence already collected and disclose the limitation instead of silently continuing.
 
 ## Plan
 
@@ -19,6 +19,14 @@ Create or update `runs/<session>/plan.json`:
 ```json
 {
   "topic": "...",
+  "research_bounds": {
+    "task_budget": 12,
+    "follow_up_task_budget": 4,
+    "follow_up_discovery_rounds": 1,
+    "max_workers": 4,
+    "per_task_timeout_seconds": 300,
+    "backend_guidance": null
+  },
   "tasks": [
     {
       "id": "architecture",
@@ -29,6 +37,8 @@ Create or update `runs/<session>/plan.json`:
   ]
 }
 ```
+
+`research_bounds` is manager-owned metadata and must contain the actual selected values before the first execution, not labels such as `"request-specific"` or `"optional"`. `task_budget` caps all task IDs admitted during the run; `follow_up_task_budget` is the subset available for tasks appended after the first execution. For open-set work, `follow_up_discovery_rounds` must be at most `1`; for a closed-set comparison it is `0` unless the user explicitly broadens discovery. `backend_guidance` is either a concrete backend-supported limit/guidance object or `null` when the selected backend cannot honor such a limit. Treat these recorded bounds as immutable for the run; a materially changed scope should use a new session rather than silently rewriting the budget after spend.
 
 Task IDs must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` and be unique. Once a task ID has been admitted to durable state, later plan revisions are append-only. Once any attempt exists for an ID, its `id`, `title`, `objective`, and ordered `queries` are immutable. Changed research uses a new task ID.
 
@@ -53,6 +63,8 @@ Use 3–4 stable coarse routes whose combined coverage includes all of the follo
 - **mechanism / capability language** — architectural or functional properties that could solve the problem;
 - **neighboring ecosystem / snowballing** — related-work pages, lists, directories, inspirations, dependencies, comparison articles, README links, citations, and terminology discovered from candidates.
 
+The adapted 3–4 routes must collectively cover **category/products, mechanisms, components/methods, and adjacent/long-tail candidates**. Components/methods may be covered through the product/category, mechanism/capability, or neighboring-ecosystem route; this does not require a fifth runner phase or worker type.
+
 Problem/user language and product/category language may be combined when that is sufficient, but never omit mechanism/capability or adjacent/long-tail coverage. These are query routes, not runner phases or worker types.
 
 Popularity metadata is never an admission gate. Stars, forks, topics, implementation language, release count, and similar metadata may inform later maturity analysis, but must not prevent a materially relevant candidate from reaching screening.
@@ -69,7 +81,7 @@ Example:
 python research.py run --session <session> --backend opencode --fallback-backend cursor --max-workers 4 --timeout 300
 ```
 
-Use the bounds selected for the request rather than copying the example values blindly.
+Use the values recorded in `plan.json.research_bounds` rather than copying the example values blindly, and do not invoke the runner with `--max-workers` or `--timeout` values that disagree with the recorded bounds.
 
 The runner may exit `0` even when individual tasks are `failed`; inspect the printed summary and `runs/<session>/state.json`. Non-zero means the runner could not safely interpret or continue the run.
 
@@ -88,11 +100,12 @@ Minimum shape:
     "exclude_when": ["No usable primary source exists"]
   },
   "research_bounds": {
-    "task_budget": "request-specific",
+    "task_budget": 12,
+    "follow_up_task_budget": 4,
     "follow_up_discovery_rounds": 1,
     "max_workers": 4,
     "per_task_timeout_seconds": 300,
-    "backend_guidance": "optional; only when the backend can honor it"
+    "backend_guidance": null
   },
   "control_checks": [
     {
@@ -115,6 +128,8 @@ Minimum shape:
   ]
 }
 ```
+
+Mirror the pre-run `plan.json.research_bounds` values into `candidates.json`; do not choose a new budget after discovery has already spent work.
 
 Persist every materially distinct discovered candidate, including those not selected for deep research. Allowed statuses are exactly `shortlisted`, `adjacent`, and `excluded`.
 
@@ -195,7 +210,7 @@ Each synthesized claim must resolve through accepted evidence references to cano
 
 - remove or explicitly mark as unverified any recommendation-bearing claim with no accepted evidence reference;
 - reject malformed or unresolvable evidence references;
-- verify that the cited source actually supports the claimed evidence; citation existence alone is not claim support.
+- verify that the cited source actually supports the claimed evidence; if a citation resolves but the source does not support the claim, reject the claim or remove/mark it unverified before `FINAL_REPORT.md`. Citation existence alone is not claim support.
 
 Normalize canonical URLs before comparing candidates or sources. Cluster obvious mirrors, forks, syndicated copies, and derivative republications before counting or reporting semantic corroboration depth. The manager owns this semantic source-independence judgment.
 
