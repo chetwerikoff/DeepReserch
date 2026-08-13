@@ -304,6 +304,62 @@ def build_invocation(
     return Invocation(backend, tuple(argv), env, prompt, cursor_mcp_json)
 
 
+def _opencode_preflight_failure(reason: str) -> str:
+    return f"opencode_safe_mode_preflight_failed:{reason}"
+
+
+def verify_opencode_safe_mode(inv: Invocation, timeout: float) -> str | None:
+    """Resolve OpenCode config before worker launch and fail closed unless the effective agent is research-safe."""
+    try:
+        resolved = subprocess.run(
+            [inv.argv[0], "debug", "config"],
+            env=dict(inv.env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _opencode_preflight_failure("timeout")
+    except (FileNotFoundError, OSError) as e:
+        return _opencode_preflight_failure(f"launch:{type(e).__name__}")
+    if resolved.returncode != 0:
+        return _opencode_preflight_failure(f"exit:{resolved.returncode}")
+    try:
+        cfg = json.loads(resolved.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return _opencode_preflight_failure("invalid_json")
+    if not isinstance(cfg, dict):
+        return _opencode_preflight_failure("non_object_config")
+    global_permission = cfg.get("permission")
+    agents = cfg.get("agent")
+    agent = agents.get(OPENCODE_AGENT) if isinstance(agents, dict) else None
+    agent_permission = agent.get("permission") if isinstance(agent, dict) else None
+    if not isinstance(global_permission, dict):
+        return _opencode_preflight_failure("global_permission_missing")
+    if not isinstance(agent, dict):
+        return _opencode_preflight_failure("agent_missing")
+    if agent.get("mode") != "primary":
+        return _opencode_preflight_failure("agent_mode")
+    if not isinstance(agent_permission, dict):
+        return _opencode_preflight_failure("agent_permission_missing")
+    for key in OPENCODE_DENY:
+        if global_permission.get(key) != "deny":
+            return _opencode_preflight_failure(f"global_permission:{key}")
+        if agent_permission.get(key) != "deny":
+            return _opencode_preflight_failure(f"agent_permission:{key}")
+    mcp = cfg.get("mcp")
+    exa = mcp.get(EXA_MCP_NAME) if isinstance(mcp, dict) else None
+    if not (
+        isinstance(exa, dict)
+        and exa.get("type") == "remote"
+        and exa.get("url") == EXA_MCP_URL
+        and exa.get("enabled") is True
+    ):
+        return _opencode_preflight_failure("exa_mcp")
+    return None
+
+
 def _opencode_failure(reason: str) -> str:
     return f"opencode_agent_verification_failed:{reason}"
 
@@ -364,6 +420,10 @@ def verify_opencode_output(inv: Invocation, stdout: bytes, timeout: float) -> tu
 
 def subprocess_executor(inv: Invocation, timeout: float) -> InvocationResult:
     try:
+        if inv.backend == "opencode":
+            preflight_error = verify_opencode_safe_mode(inv, timeout)
+            if preflight_error:
+                return InvocationResult(b"", b"", 0, False, preflight_error, b"")
         p = subprocess.run(inv.argv, env=dict(inv.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
         if inv.backend == "opencode" and p.returncode == 0:
             answer, session_id, agent, verification_error = verify_opencode_output(inv, p.stdout, timeout)
