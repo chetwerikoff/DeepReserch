@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import research
+
+
+VALID_FINDINGS = b'{"findings":[{"id":"f1","claim":"claim","source_url":"https://example.com/a","source_tier":"S"}]}'
+
+
+def plan(*ids: str) -> dict:
+    return {
+        "topic": "topic",
+        "tasks": [
+            {
+                "id": task_id,
+                "title": task_id.title(),
+                "objective": f"research {task_id}",
+                "queries": [f"query {task_id}"],
+            }
+            for task_id in ids
+        ],
+    }
+
+
+class SequenceExecutor:
+    def __init__(self, results):
+        self.results = list(results)
+        self.invocations = []
+        self.lock = threading.Lock()
+
+    def __call__(self, invocation, timeout):
+        with self.lock:
+            self.invocations.append(invocation)
+            if not self.results:
+                raise AssertionError("unexpected extra invocation")
+            item = self.results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class ResearchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.runs = self.root / "runs"
+        self.worker = ROOT / "prompts" / "worker.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def runner(self, executor, **kwargs):
+        return research.ResearchRunner(
+            session=kwargs.pop("session", "s1"),
+            runs_dir=self.runs,
+            backend=kwargs.pop("backend", "opencode"),
+            fallback_backend=kwargs.pop("fallback_backend", None),
+            max_workers=kwargs.pop("max_workers", 2),
+            timeout=1,
+            executor=executor,
+            worker_contract_path=self.worker,
+            **kwargs,
+        )
+
+    def test_cursor_invocation_is_ask_mode_and_never_force(self):
+        inv = research.build_invocation(
+            "cursor", "hello", model="m1", cursor_command="cursor-agent", base_env={}
+        )
+        self.assertEqual(inv.argv[:5], ("cursor-agent", "--print", "--mode=ask", "--output-format", "text"))
+        self.assertIn("--model", inv.argv)
+        self.assertNotIn("--force", inv.argv)
+
+    def test_opencode_invocation_enforces_global_and_agent_denials(self):
+        existing = {
+            "permission": {"websearch": "allow", "edit": "allow"},
+            "agent": {research.OPENCODE_AGENT: {"permission": {"bash": "allow"}}},
+            "model": "provider/model",
+        }
+        inv = research.build_invocation(
+            "opencode",
+            "hello",
+            opencode_command="opencode",
+            base_env={"OPENCODE_CONFIG_CONTENT": json.dumps(existing)},
+        )
+        self.assertEqual(inv.argv[:5], ("opencode", "run", "--agent", research.OPENCODE_AGENT, "--format"))
+        self.assertNotIn("--attach", inv.argv)
+        cfg = json.loads(inv.env["OPENCODE_CONFIG_CONTENT"])
+        for key in ("edit", "bash", "external_directory", "task"):
+            self.assertEqual(cfg["permission"][key], "deny")
+            self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "deny")
+        self.assertEqual(cfg["permission"]["websearch"], "allow")
+        self.assertEqual(cfg["model"], "provider/model")
+
+    def test_invalid_inline_opencode_config_fails_closed(self):
+        with self.assertRaises(research.RunnerFatal):
+            research.build_invocation("opencode", "x", base_env={"OPENCODE_CONFIG_CONTENT": "{"})
+
+    def test_plan_rejects_bad_and_duplicate_ids(self):
+        bad = plan("ok")
+        bad["tasks"][0]["id"] = "../escape"
+        with self.assertRaises(research.RunnerFatal):
+            research.validate_plan(bad)
+        dup = plan("same", "same")
+        with self.assertRaises(research.RunnerFatal):
+            research.validate_plan(dup)
+
+    def test_contained_path_rejects_escape(self):
+        base = self.root / "safe"
+        base.mkdir()
+        with self.assertRaises(research.RunnerFatal):
+            research.safe_path(base, "..", "outside")
+
+    def test_primary_success_writes_raw_result_and_state(self):
+        ex = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        summary = self.runner(ex).execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["counts"]["completed"], 1)
+        raw = self.runs / "s1" / "raw" / "a-attempt-01.txt"
+        result = self.runs / "s1" / "results" / "a.json"
+        self.assertTrue(raw.exists())
+        self.assertTrue(result.exists())
+        raw_value = json.loads(raw.read_text())
+        self.assertEqual(research.base64.b64decode(raw_value["stdout_b64"]), VALID_FINDINGS)
+        result_value = json.loads(result.read_text())
+        self.assertEqual(result_value["accepted_attempt_ordinal"], 1)
+        self.assertEqual(result_value["task_id"], "a")
+
+    def test_invalid_primary_then_invalid_repair_then_fallback_success_exactly_three(self):
+        ex = SequenceExecutor(
+            [
+                research.InvocationResult(b"not-json", b"", 0),
+                research.InvocationResult(b'{"findings":"bad"}', b"", 0),
+                research.InvocationResult(VALID_FINDINGS, b"", 0),
+            ]
+        )
+        summary = self.runner(ex, fallback_backend="cursor").execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "completed")
+        self.assertEqual(len(ex.invocations), 3)
+        state = json.loads((self.runs / "s1" / "state.json").read_text())
+        kinds = [a["kind"] for a in state["tasks"]["a"]["attempts"]]
+        self.assertEqual(kinds, ["primary-research", "primary-format-repair", "fallback-research"])
+        self.assertEqual(state["tasks"]["a"]["accepted_attempt_ordinal"], 3)
+        self.assertIn("not-json", ex.invocations[1].prompt)
+        self.assertIn("worker stdout has no JSON object", ex.invocations[1].prompt)
+        self.assertNotIn("research a", ex.invocations[1].prompt)
+
+    def test_primary_timeout_goes_directly_to_fallback(self):
+        ex = SequenceExecutor(
+            [
+                research.InvocationResult(b"", b"", None, True),
+                research.InvocationResult(VALID_FINDINGS, b"", 0),
+            ]
+        )
+        summary = self.runner(ex, fallback_backend="cursor").execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "completed")
+        self.assertEqual(len(ex.invocations), 2)
+        state = json.loads((self.runs / "s1" / "state.json").read_text())
+        self.assertEqual([a["kind"] for a in state["tasks"]["a"]["attempts"]], ["primary-research", "fallback-research"])
+
+    def test_fallback_invalid_stops_without_fourth_invocation(self):
+        ex = SequenceExecutor(
+            [
+                research.InvocationResult(b"bad", b"", 0),
+                research.InvocationResult(b"still bad", b"", 0),
+                research.InvocationResult(b"fallback bad", b"", 0),
+            ]
+        )
+        summary = self.runner(ex, fallback_backend="cursor").execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "failed")
+        self.assertEqual(len(ex.invocations), 3)
+
+    def test_task_local_failure_does_not_stop_sibling(self):
+        barrier = threading.Barrier(2)
+        calls = []
+
+        def executor(inv, timeout):
+            calls.append(inv)
+            barrier.wait(timeout=2)
+            if "research bad" in inv.prompt:
+                return research.InvocationResult(b"", b"boom", 1)
+            return research.InvocationResult(VALID_FINDINGS, b"", 0)
+
+        summary = self.runner(executor, max_workers=2).execute(research.validate_plan(plan("bad", "good")))
+        self.assertEqual(summary["tasks"]["bad"]["status"], "failed")
+        self.assertEqual(summary["tasks"]["good"]["status"], "completed")
+
+    def test_concurrent_completions_preserve_both_state_updates(self):
+        barrier = threading.Barrier(2)
+
+        def executor(inv, timeout):
+            barrier.wait(timeout=2)
+            return research.InvocationResult(VALID_FINDINGS, b"", 0)
+
+        summary = self.runner(executor, max_workers=2).execute(research.validate_plan(plan("a", "b")))
+        self.assertEqual(summary["counts"]["completed"], 2)
+        state = json.loads((self.runs / "s1" / "state.json").read_text())
+        self.assertEqual(state["tasks"]["a"]["status"], "completed")
+        self.assertEqual(state["tasks"]["b"]["status"], "completed")
+
+    def test_unknown_inflight_after_crash_is_consumed_and_not_replayed(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        crashing = SequenceExecutor([SimulatedCrash("power loss")])
+        with self.assertRaises(research.RunnerFatal):
+            self.runner(crashing).execute(research.validate_plan(plan("a")))
+        state = json.loads((self.runs / "s1" / "state.json").read_text())
+        self.assertEqual(state["tasks"]["a"]["status"], "in_flight")
+        self.assertEqual(len(state["tasks"]["a"]["attempts"]), 1)
+        self.assertFalse((self.runs / "s1" / "raw" / "a-attempt-01.txt").exists())
+
+        resumed = SequenceExecutor([])
+        summary = self.runner(resumed).execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "failed")
+        self.assertEqual(len(resumed.invocations), 0)
+        state2 = json.loads((self.runs / "s1" / "state.json").read_text())
+        self.assertEqual(len(state2["tasks"]["a"]["attempts"]), 1)
+        self.assertIn("interrupted_unknown", state2["tasks"]["a"]["error"])
+
+    def test_resume_from_complete_raw_continues_without_relaunch(self):
+        p = research.validate_plan(plan("a"))
+        runner = self.runner(SequenceExecutor([]))
+        runner.admit(p)
+        attempt = runner.start("a", "primary-research", "opencode", None)
+        research.exclusive_write(runner.raw_path("a", attempt["ordinal"]), research.json_bytes(research.raw_value(attempt, research.InvocationResult(VALID_FINDINGS, b"", 0))))
+
+        resumed = SequenceExecutor([])
+        summary = self.runner(resumed).execute(p)
+        self.assertEqual(summary["tasks"]["a"]["status"], "completed")
+        self.assertEqual(len(resumed.invocations), 0)
+
+    def test_result_to_state_crash_reconciles_without_relaunch(self):
+        p = research.validate_plan(plan("a"))
+        runner = self.runner(SequenceExecutor([]))
+        runner.admit(p)
+        attempt = runner.start("a", "primary-research", "opencode", None)
+        research.exclusive_write(runner.raw_path("a", attempt["ordinal"]), research.json_bytes(research.raw_value(attempt, research.InvocationResult(VALID_FINDINGS, b"", 0))))
+        state = runner.state["tasks"]["a"]
+        result = {
+            "task_id": "a",
+            "task_definition_sha256": state["task_definition_sha256"],
+            "accepted_attempt_ordinal": 1,
+            "findings": research.validate_findings(json.loads(VALID_FINDINGS)),
+        }
+        research.atomic_json(runner.result_path("a"), result)
+        resumed = SequenceExecutor([])
+        summary = self.runner(resumed).execute(p)
+        self.assertEqual(summary["tasks"]["a"]["status"], "completed")
+        self.assertEqual(len(resumed.invocations), 0)
+
+    def test_completed_task_is_skipped_on_resume(self):
+        first = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        self.runner(first).execute(research.validate_plan(plan("a")))
+        second = SequenceExecutor([])
+        summary = self.runner(second).execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "completed")
+        self.assertEqual(second.invocations, [])
+
+    def test_task_definition_drift_after_attempt_is_runner_fatal(self):
+        first = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        self.runner(first).execute(research.validate_plan(plan("a")))
+        changed = plan("a")
+        changed["tasks"][0]["objective"] = "changed semantics"
+        with self.assertRaises(research.RunnerFatal):
+            self.runner(SequenceExecutor([])).execute(research.validate_plan(changed))
+
+    def test_task_definition_drift_after_admission_before_launch_is_fatal(self):
+        original = research.validate_plan(plan("a"))
+        self.runner(SequenceExecutor([])).admit(original)
+        changed = plan("a")
+        changed["tasks"][0]["queries"] = ["changed query"]
+        with self.assertRaises(research.RunnerFatal):
+            self.runner(SequenceExecutor([])).execute(research.validate_plan(changed))
+
+    def test_plan_revision_may_append_new_id_only(self):
+        first = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        self.runner(first).execute(research.validate_plan(plan("a")))
+        second = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        summary = self.runner(second).execute(research.validate_plan(plan("a", "b")))
+        self.assertEqual(summary["counts"]["completed"], 2)
+        self.assertEqual(len(second.invocations), 1)
+        self.assertIn("research b", second.invocations[0].prompt)
+
+        with self.assertRaises(research.RunnerFatal):
+            self.runner(SequenceExecutor([])).execute(research.validate_plan(plan("b")))
+
+    def test_source_group_github_repo_and_hostname(self):
+        self.assertEqual(research.source_group("https://github.com/Owner/Repo/issues/1"), "github.com/owner/repo")
+        self.assertEqual(research.source_group("https://docs.example.com/a"), "docs.example.com")
+
+    def test_metrics_dedupe_groups_and_weak_ids(self):
+        p = research.validate_plan(plan("a", "b"))
+        ex = SequenceExecutor([
+            research.InvocationResult(b'{"findings":[{"id":"f1","claim":"c1","source_url":"https://github.com/O/R/a"},{"id":"f2","claim":"c2","source_url":"https://github.com/O/R/b"}]}', b"", 0),
+            research.InvocationResult(b'{"findings":[{"id":"f1","claim":"c3","source_url":"https://example.org/x"}]}', b"", 0),
+        ])
+        self.runner(ex).execute(p)
+        synthesis = {
+            "insights": [
+                {"id": "i1", "claim": "x", "evidence": ["a:f1", "a:f2", "b:f1"]},
+                {"id": "i2", "claim": "y", "evidence": ["a:f1"]},
+            ]
+        }
+        research.atomic_json(self.runs / "s1" / "synthesis.json", synthesis)
+        metrics = research.compute_metrics(self.runs / "s1")
+        self.assertEqual(metrics["insights"][0]["source_group_depth"], 2)
+        self.assertEqual(metrics["minimum_depth"], 1)
+        self.assertEqual(metrics["weak_insight_ids"], ["i2"])
+        self.assertIn("do not prove", metrics["disclaimer"])
+        serialized = json.dumps(metrics)
+        self.assertNotIn("saturation", serialized.lower())
+        self.assertNotIn("completeness", serialized.lower())
+
+    def test_metrics_reject_missing_or_malformed_refs(self):
+        ex = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        self.runner(ex).execute(research.validate_plan(plan("a")))
+        for evidence in (["a:missing"], ["bad:ref:shape"]):
+            research.atomic_json(
+                self.runs / "s1" / "synthesis.json",
+                {"insights": [{"id": "i1", "claim": "x", "evidence": evidence}]},
+            )
+            with self.assertRaises(research.RunnerFatal):
+                research.compute_metrics(self.runs / "s1")
+
+    def test_worker_output_rejects_duplicate_findings_and_bad_url(self):
+        with self.assertRaises(research.ValidationError):
+            research.validate_findings(
+                {
+                    "findings": [
+                        {"id": "f1", "claim": "x", "source_url": "not-url"},
+                        {"id": "f1", "claim": "y", "source_url": "https://example.com"},
+                    ]
+                }
+            )
+
+    def test_extract_json_tolerates_fence_and_chatter(self):
+        payload = research.extract_object("hello\n```json\n{\"findings\": []}\n```\nbye")
+        self.assertEqual(payload, {"findings": []})
+
+    def test_cli_task_failure_exits_zero_but_missing_backend_is_fatal(self):
+        plan_path = self.root / "plan.json"
+        plan_path.write_text(json.dumps(plan("a")), encoding="utf-8")
+        fake = self.root / "cursor-fail"
+        fake.write_text("#!/bin/sh\necho boom >&2\nexit 1\n", encoding="utf-8")
+        fake.chmod(0o755)
+        rc = research.main([
+            "run", "--session", "cli1", "--runs-dir", str(self.runs),
+            "--plan", str(plan_path), "--backend", "cursor",
+            "--cursor-command", str(fake), "--max-workers", "1",
+        ])
+        self.assertEqual(rc, 0)
+        state = json.loads((self.runs / "cli1" / "state.json").read_text())
+        self.assertEqual(state["tasks"]["a"]["status"], "failed")
+
+        rc2 = research.main([
+            "run", "--session", "cli2", "--runs-dir", str(self.runs),
+            "--plan", str(plan_path), "--backend", "cursor",
+            "--cursor-command", str(self.root / "missing-cursor"),
+        ])
+        self.assertEqual(rc2, 2)
+
+    def test_preexisting_raw_symlink_escape_is_rejected(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink unavailable")
+        run_root = self.runs / "s1"
+        run_root.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        try:
+            os.symlink(outside, run_root / "raw", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        with self.assertRaises(research.RunnerFatal):
+            self.runner(SequenceExecutor([]))
+
+    def test_atomic_write_replaces_with_complete_json(self):
+        path = self.root / "state.json"
+        research.atomic_json(path, {"a": 1})
+        research.atomic_json(path, {"b": 2})
+        self.assertEqual(json.loads(path.read_text()), {"b": 2})
+
+
+if __name__ == "__main__":
+    unittest.main()
