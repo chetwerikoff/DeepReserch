@@ -14,8 +14,16 @@ TIERS = {"S", "A", "B", "C", "D"}
 KINDS = {"primary-research", "primary-format-repair", "fallback-research"}
 BACKENDS = {"opencode", "cursor"}
 OPENCODE_AGENT = "deep-research-worker"
+EXA_MCP_NAME = "exa"
+EXA_MCP_URL = "https://mcp.exa.ai/mcp"
+EXA_MCP_TOOLS = {"exa_web_search_exa": "allow", "exa_web_fetch_exa": "allow"}
 OPENCODE_DENY = {"edit": "deny", "bash": "deny", "external_directory": "deny", "task": "deny"}
-OPENCODE_ALLOW = {"list": "allow", "glob": "allow", "grep": "allow", "webfetch": "allow", "websearch": "allow"}
+OPENCODE_ALLOW = {
+    "list": "allow",
+    "glob": "allow",
+    "grep": "allow",
+}
+OPENCODE_WEB_ALLOW = {"webfetch": "allow", "websearch": "allow"}
 OPENCODE_READ = {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"}
 
 
@@ -174,19 +182,28 @@ def parse_stdout(data: bytes) -> list[dict[str, Any]]: return validate_findings(
 
 
 def opencode_research_permissions(global_permission: Any, agent_permission: Any) -> dict[str, Any]:
-    safe: dict[str, Any] = {"*": "deny", "read": copy.deepcopy(OPENCODE_READ), **OPENCODE_ALLOW, **OPENCODE_DENY}
+    safe: dict[str, Any] = {
+        "*": "deny",
+        "read": copy.deepcopy(OPENCODE_READ),
+        **OPENCODE_ALLOW,
+        **OPENCODE_WEB_ALLOW,
+        **EXA_MCP_TOOLS,
+        **OPENCODE_DENY,
+    }
     for source in (global_permission, agent_permission):
         if source == "deny":
-            for key in ("read", *OPENCODE_ALLOW): safe[key] = "deny"
+            for key in ("read", *OPENCODE_ALLOW, *EXA_MCP_TOOLS):
+                safe[key] = "deny"
             continue
         if not isinstance(source, dict): continue
-        for key in ("read", *OPENCODE_ALLOW):
+        for key in ("read", *OPENCODE_ALLOW, *EXA_MCP_TOOLS):
             value = source.get(key)
             if value == "deny":
                 safe[key] = "deny"
             elif key == "read" and isinstance(value, dict) and isinstance(safe["read"], dict):
                 for pattern, action in value.items():
                     if action == "deny": safe["read"][pattern] = "deny"
+    safe.update(OPENCODE_WEB_ALLOW)
     return safe
 
 
@@ -200,7 +217,19 @@ def opencode_config(existing: str | None) -> str:
     global_permission = cfg.get("permission")
     perms = copy.deepcopy(global_permission) if isinstance(global_permission, dict) else {}
     for key, value in OPENCODE_ALLOW.items(): perms.setdefault(key, value)
-    perms.update(OPENCODE_DENY); cfg["permission"] = perms
+    perms.update(OPENCODE_WEB_ALLOW)
+    perms.update(EXA_MCP_TOOLS)
+    perms.update(OPENCODE_DENY)
+    cfg["permission"] = perms
+    cfg["mcp"] = {
+        EXA_MCP_NAME: {
+            "type": "remote",
+            "url": EXA_MCP_URL,
+            "enabled": True,
+            "oauth": False,
+            "codemode": False,
+        }
+    }
     agents = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}; agents = copy.deepcopy(agents)
     agent = agents.get(OPENCODE_AGENT) if isinstance(agents.get(OPENCODE_AGENT), dict) else {}; agent = copy.deepcopy(agent)
     agent_permission = agent.get("permission")
@@ -209,10 +238,25 @@ def opencode_config(existing: str | None) -> str:
     return json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def build_invocation(backend: str, prompt: str, model: str | None = None, cursor_command="cursor-agent", opencode_command="opencode", base_env=None) -> Invocation:
+def build_invocation(
+    backend: str,
+    prompt: str,
+    model: str | None = None,
+    cursor_command="cursor-agent",
+    opencode_command="opencode",
+    base_env=None,
+    cursor_workspace: Path | None = None,
+) -> Invocation:
     env = dict(os.environ if base_env is None else base_env)
     if backend == "cursor":
-        argv = [cursor_command, "--print", "--mode=ask", "--output-format", "text"]
+        argv = [cursor_command, "--print", "--mode=ask", "--output-format", "text", "--approve-mcps"]
+        if cursor_workspace is not None:
+            workspace = Path(cursor_workspace).resolve(strict=False)
+            atomic_json(
+                safe_path(workspace, ".cursor", "mcp.json"),
+                {"mcpServers": {EXA_MCP_NAME: {"url": EXA_MCP_URL}}},
+            )
+            argv += ["--workspace", str(workspace)]
         if model: argv += ["--model", model]
         argv.append(prompt)
     elif backend == "opencode":
@@ -386,7 +430,14 @@ class ResearchRunner:
 
     def invoke(self, tid: str, kind: str, backend: str, prompt: str, model: str | None) -> tuple[dict[str,Any],InvocationResult]:
         # Build safe argv/env before consuming the attempt; no process starts until state is durable.
-        inv=build_invocation(backend,prompt,model,self.cursor_command,self.opencode_command)
+        inv=build_invocation(
+            backend,
+            prompt,
+            model,
+            self.cursor_command,
+            self.opencode_command,
+            cursor_workspace=self.root if backend == "cursor" else None,
+        )
         a=self.start(tid,kind,backend,model); result=self.executor(inv,self.timeout)
         try: exclusive_write(self.raw_path(tid,a["ordinal"]), json_bytes(raw_value(a,result)))
         except FileExistsError as e: raise RunnerFatal("raw attempt clobber refused") from e
