@@ -74,6 +74,23 @@ class ResearchTests(unittest.TestCase):
             **kwargs,
         )
 
+    def fake_opencode(self):
+        path = self.root / "fake-opencode.py"
+        path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "if sys.argv[1] == 'export':\n"
+            "    print(json.dumps({'info': {'id': sys.argv[2], 'agent': os.environ.get('FAKE_AGENT', 'deep-research-worker')}}))\n"
+            "else:\n"
+            "    sid = 'fake-session'\n"
+            "    print(json.dumps({'type': 'step_start', 'sessionID': sid, 'part': {'type': 'step-start'}}))\n"
+            "    print(json.dumps({'type': 'text', 'sessionID': sid, 'part': {'type': 'text', 'text': '{\"findings\":[]}'} }))\n"
+            "    print(json.dumps({'type': 'step_finish', 'sessionID': sid, 'part': {'type': 'step-finish'}}))\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
+
     def test_cursor_invocation_is_ask_mode_and_never_force(self):
         inv = research.build_invocation(
             "cursor",
@@ -133,6 +150,106 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "allow")
         self.assertEqual(cfg["model"], "provider/model")
 
+    def test_raw_cursor_attempt_records_argv_and_mcp_content(self):
+        ex = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        summary = self.runner(ex, backend="cursor").execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["counts"]["completed"], 1)
+        raw = json.loads((self.runs / "s1" / "raw" / "a-attempt-01.txt").read_text())
+        self.assertEqual(raw["schema"], "deep-research-raw-attempt/v2")
+        self.assertEqual(raw["argv"], list(ex.invocations[0].argv))
+        self.assertEqual(raw["argv"][2], "--mode=ask")
+        self.assertNotIn("--force", raw["argv"])
+        self.assertIsNone(raw["opencode_config_content"])
+        self.assertEqual(
+            raw["cursor_mcp_json"],
+            {"mcpServers": {research.EXA_MCP_NAME: {"url": research.EXA_MCP_URL}}},
+        )
+
+    def test_raw_opencode_config_redacts_credentials_and_keeps_audit_structure(self):
+        secret_api_key = "host-api-key-should-not-persist"
+        secret_token = "host-token-should-not-persist"
+        secret_header = "Bearer host-header-should-not-persist"
+        existing = {
+            "provider": {
+                "host": {
+                    "options": {
+                        "apiKey": secret_api_key,
+                        "access_token": secret_token,
+                        "headers": {"Authorization": secret_header},
+                    }
+                }
+            },
+            "permission": {"edit": "allow"},
+            "agent": {research.OPENCODE_AGENT: {"permission": {"bash": "allow"}}},
+            "model": "host/model",
+        }
+        ex = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        runner = self.runner(ex)
+        runner = research.ResearchRunner(
+            session="s1",
+            runs_dir=self.runs,
+            backend="opencode",
+            max_workers=2,
+            timeout=1,
+            executor=ex,
+            worker_contract_path=self.worker,
+        )
+        with patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(existing)}, clear=False):
+            runner.execute(research.validate_plan(plan("a")))
+        raw_path = self.runs / "s1" / "raw" / "a-attempt-01.txt"
+        raw_text = raw_path.read_text()
+        self.assertNotIn(secret_api_key, raw_text)
+        self.assertNotIn(secret_token, raw_text)
+        self.assertNotIn(secret_header, raw_text)
+        persisted = json.loads(json.loads(raw_text)["opencode_config_content"])
+        options = persisted["provider"]["host"]["options"]
+        self.assertEqual(options["apiKey"], "[REDACTED]")
+        self.assertEqual(options["access_token"], "[REDACTED]")
+        self.assertEqual(options["headers"], "[REDACTED]")
+        self.assertEqual(persisted["model"], "host/model")
+        self.assertIn("permission", persisted)
+        self.assertIn("agent", persisted)
+        self.assertEqual(persisted["agent"][research.OPENCODE_AGENT]["permission"]["edit"], "deny")
+        self.assertEqual(
+            persisted["mcp"][research.EXA_MCP_NAME]["url"],
+            research.EXA_MCP_URL,
+        )
+
+    def test_opencode_subprocess_verification_accepts_selected_agent(self):
+        command = self.fake_opencode()
+        inv = research.build_invocation(
+            "opencode", "hello", opencode_command=str(command), base_env={"FAKE_AGENT": research.OPENCODE_AGENT}
+        )
+        result = research.subprocess_executor(inv, 1)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(result.verification_error)
+        self.assertEqual(result.opencode_session_id, "fake-session")
+        self.assertEqual(result.opencode_agent, research.OPENCODE_AGENT)
+        self.assertEqual(result.stdout, b'{"findings":[]}')
+        self.assertNotEqual(result.raw_stdout, result.stdout)
+
+    def test_opencode_fallback_agent_fails_task_without_extra_attempt(self):
+        command = self.fake_opencode()
+        runner = self.runner(research.subprocess_executor, opencode_command=str(command))
+        with patch.dict(os.environ, {"FAKE_AGENT": "default"}, clear=False):
+            summary = runner.execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "failed")
+        self.assertEqual(summary["tasks"]["a"]["attempts"], 1)
+        state = json.loads((self.runs / "s1" / "state.json").read_text())
+        self.assertIn("opencode_agent_verification_failed:unexpected_agent:default", state["tasks"]["a"]["error"])
+        raw = json.loads((self.runs / "s1" / "raw" / "a-attempt-01.txt").read_text())
+        self.assertEqual(raw["opencode_agent"], "default")
+        self.assertIn("opencode_agent_verification_failed", raw["verification_error"])
+        self.assertFalse((self.runs / "s1" / "results" / "a.json").exists())
+
+    def test_opencode_selected_agent_run_is_accepted(self):
+        command = self.fake_opencode()
+        runner = self.runner(research.subprocess_executor, opencode_command=str(command))
+        with patch.dict(os.environ, {"FAKE_AGENT": research.OPENCODE_AGENT}, clear=False):
+            summary = runner.execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["tasks"]["a"]["status"], "completed")
+        self.assertEqual(summary["tasks"]["a"]["attempts"], 1)
+
     def test_invalid_inline_opencode_config_fails_closed(self):
         with self.assertRaises(research.RunnerFatal):
             research.build_invocation("opencode", "x", base_env={"OPENCODE_CONFIG_CONTENT": "{"})
@@ -161,6 +278,10 @@ class ResearchTests(unittest.TestCase):
         self.assertTrue(raw.exists())
         self.assertTrue(result.exists())
         raw_value = json.loads(raw.read_text())
+        self.assertEqual(raw_value["schema"], "deep-research-raw-attempt/v2")
+        self.assertEqual(raw_value["argv"], list(ex.invocations[0].argv))
+        self.assertIsInstance(raw_value["opencode_config_content"], str)
+        self.assertIsNone(raw_value["cursor_mcp_json"])
         self.assertEqual(research.base64.b64decode(raw_value["stdout_b64"]), VALID_FINDINGS)
         result_value = json.loads(result.read_text())
         self.assertEqual(result_value["accepted_attempt_ordinal"], 1)
@@ -263,7 +384,11 @@ class ResearchTests(unittest.TestCase):
         runner = self.runner(SequenceExecutor([]))
         runner.admit(p)
         attempt = runner.start("a", "primary-research", "opencode", None)
-        research.exclusive_write(runner.raw_path("a", attempt["ordinal"]), research.json_bytes(research.raw_value(attempt, research.InvocationResult(VALID_FINDINGS, b"", 0))))
+        invocation = research.build_invocation("opencode", "hello", base_env={})
+        research.exclusive_write(
+            runner.raw_path("a", attempt["ordinal"]),
+            research.json_bytes(research.raw_value(attempt, invocation, research.InvocationResult(VALID_FINDINGS, b"", 0))),
+        )
 
         resumed = SequenceExecutor([])
         summary = self.runner(resumed).execute(p)
@@ -275,7 +400,11 @@ class ResearchTests(unittest.TestCase):
         runner = self.runner(SequenceExecutor([]))
         runner.admit(p)
         attempt = runner.start("a", "primary-research", "opencode", None)
-        research.exclusive_write(runner.raw_path("a", attempt["ordinal"]), research.json_bytes(research.raw_value(attempt, research.InvocationResult(VALID_FINDINGS, b"", 0))))
+        invocation = research.build_invocation("opencode", "hello", base_env={})
+        research.exclusive_write(
+            runner.raw_path("a", attempt["ordinal"]),
+            research.json_bytes(research.raw_value(attempt, invocation, research.InvocationResult(VALID_FINDINGS, b"", 0))),
+        )
         state = runner.state["tasks"]["a"]
         result = {
             "task_id": "a",

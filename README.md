@@ -104,7 +104,7 @@ unavailable, errors, or returns insufficient results. Exa preference is a prompt
 policy, not a mechanical guarantee; the existing closed-world agent default and `read` rules
 denying `*.env`/`*.env.*` remain in force.
 
-The invocation selects that agent and does not attach to an arbitrary pre-existing `opencode serve` process. The executable can be overridden with `--opencode-command`.
+The invocation selects that agent and requests OpenCode's machine-readable `--format json` event stream; it does not attach to an arbitrary pre-existing `opencode serve` process. After a successful worker process, the runner extracts the session ID from those events and queries `opencode export <sessionID>`, requiring the exported session's `info.agent` to equal `deep-research-worker`. A missing, ambiguous, unexportable, or different agent is a task-local `opencode_agent_verification_failed:*` failure, so the result cannot be accepted or silently fall back to OpenCode's default agent; this is the strongest positive signal exposed by OpenCode 1.18.14, whose export record does not independently expose the complete effective tool-permission map. The check deliberately fails closed if this CLI/session-record contract changes. The executable can be overridden with `--opencode-command`.
 
 These controls are mechanical. The worker prompt also says not to write, but prompt wording is not the security boundary.
 
@@ -113,6 +113,19 @@ These controls are mechanical. The worker prompt also says not to write, but pro
 Before every external worker subprocess starts, `state.json` atomically records the attempt ordinal, kind, backend, and `in_flight` phase. That write consumes the lifetime attempt.
 
 If the runner dies after this durable start but before a complete raw outcome exists, restart marks the task `failed` with an interrupted/unknown reason and **does not replay the external call**. If a complete raw envelope exists, restart can safely continue the deterministic transition table without relaunching that attempt.
+
+Each complete `raw/<task>-attempt-NN.txt` is a `deep-research-raw-attempt/v2` envelope. Besides the captured outcome, it records the exact child `argv`, the injected OpenCode config, and the runner-written Cursor `.cursor/mcp.json` content. The persisted OpenCode config is a structural copy with every value under a secret-ish key (`apiKey`, tokens, secrets, passwords, credentials, auth/authorization/bearer, private/client keys, sessions, cookies, signatures, or headers) replaced by the visible marker `[REDACTED]`; the `mcp`, global and agent `permission`, `agent`, and `model` structures remain available for post-hoc audit. The full worker prompt remains in `argv` deliberately: it is launch evidence, not a credential source.
+
+`v2` is not backward compatible on purpose: a `v1` envelope is rejected, so a session started before this
+change cannot be resumed and fails loudly instead of being read under the wrong assumptions. Since
+`runs/**` is disposable and ungitted, the migration cost is one abandoned in-flight session. Start a new
+session rather than trying to resume across the upgrade.
+
+An OpenCode attempt captures the raw JSON event stream in `stdout_b64` and the reconstructed worker
+answer in `answer_stdout_b64`. That reconstruction concatenates the `text` events of the session, so
+worker output parsing is coupled to OpenCode's event structure rather than to plain stdout bytes. A change
+in that structure surfaces as a parse failure, not as silently wrong findings, but it is a real dependency
+on the CLI's output contract.
 
 The automatic lifetime policy is closed:
 
