@@ -79,9 +79,17 @@ class ResearchTests(unittest.TestCase):
         path.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
-            "if sys.argv[1] == 'export':\n"
+            "if sys.argv[1:3] == ['debug', 'config']:\n"
+            "    if os.environ.get('FAKE_CONFIG_MODE') == 'permissive':\n"
+            "        print(json.dumps({'permission': {'edit': 'allow', 'bash': 'allow', 'external_directory': 'allow', 'task': 'allow'}, 'agent': {'deep-research-worker': {'mode': 'primary', 'permission': {'edit': 'allow', 'bash': 'allow', 'external_directory': 'allow', 'task': 'allow'}}}, 'mcp': {'exa': {'type': 'remote', 'url': 'https://mcp.exa.ai/mcp', 'enabled': True}}}))\n"
+            "    else:\n"
+            "        print(os.environ['OPENCODE_CONFIG_CONTENT'])\n"
+            "elif sys.argv[1] == 'export':\n"
             "    print(json.dumps({'info': {'id': sys.argv[2], 'agent': os.environ.get('FAKE_AGENT', 'deep-research-worker')}}))\n"
             "else:\n"
+            "    marker = os.environ.get('FAKE_RUN_MARKER')\n"
+            "    if marker:\n"
+            "        open(marker, 'w', encoding='utf-8').write('run\\n')\n"
             "    sid = 'fake-session'\n"
             "    print(json.dumps({'type': 'step_start', 'sessionID': sid, 'part': {'type': 'step-start'}}))\n"
             "    print(json.dumps({'type': 'text', 'sessionID': sid, 'part': {'type': 'text', 'text': '{\"findings\":[]}'} }))\n"
@@ -227,6 +235,20 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(result.opencode_agent, research.OPENCODE_AGENT)
         self.assertEqual(result.stdout, b'{"findings":[]}')
         self.assertNotEqual(result.raw_stdout, result.stdout)
+
+    def test_opencode_same_name_permissive_agent_is_rejected_before_run(self):
+        command = self.fake_opencode()
+        marker = self.root / "opencode-run-marker"
+        inv = research.build_invocation(
+            "opencode",
+            "hello",
+            opencode_command=str(command),
+            base_env={"FAKE_CONFIG_MODE": "permissive", "FAKE_RUN_MARKER": str(marker)},
+        )
+        result = research.subprocess_executor(inv, 1)
+        self.assertEqual(result.verification_error, "opencode_safe_mode_preflight_failed:global_permission:edit")
+        self.assertFalse(marker.exists())
+        self.assertEqual(result.raw_stdout, b"")
 
     def test_opencode_fallback_agent_fails_task_without_extra_attempt(self):
         command = self.fake_opencode()
