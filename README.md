@@ -104,6 +104,12 @@ unavailable, errors, or returns insufficient results. Exa preference is a prompt
 policy, not a mechanical guarantee; the existing closed-world agent default and `read` rules
 denying `*.env`/`*.env.*` remain in force.
 
+Each host namespaces MCP tool names differently: the server publishes `web_search_exa`, OpenCode
+addresses it as `exa_web_search_exa`, and Cursor as `exa-web_search_exa`. `prompts/worker.md`
+therefore tells workers to match on the name suffix rather than on an exact identifier, so a
+worker does not mistake a namespacing difference for Exa being unavailable and fall back
+needlessly.
+
 The invocation selects that agent and requests OpenCode's machine-readable `--format json` event stream; it does not attach to an arbitrary pre-existing `opencode serve` process. After a successful worker process, the runner extracts the session ID from those events and queries `opencode export <sessionID>`, requiring the exported session's `info.agent` to equal `deep-research-worker`. A missing, ambiguous, unexportable, or different agent is a task-local `opencode_agent_verification_failed:*` failure, so the result cannot be accepted or silently fall back to OpenCode's default agent; this is the strongest positive signal exposed by OpenCode 1.18.14, whose export record does not independently expose the complete effective tool-permission map. The check deliberately fails closed if this CLI/session-record contract changes. The executable can be overridden with `--opencode-command`.
 
 These controls are mechanical. The worker prompt also says not to write, but prompt wording is not the security boundary.
