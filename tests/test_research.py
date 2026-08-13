@@ -76,11 +76,24 @@ class ResearchTests(unittest.TestCase):
 
     def test_cursor_invocation_is_ask_mode_and_never_force(self):
         inv = research.build_invocation(
-            "cursor", "hello", model="m1", cursor_command="cursor-agent", base_env={}
+            "cursor",
+            "hello",
+            model="m1",
+            cursor_command="cursor-agent",
+            base_env={},
+            cursor_workspace=self.root / "cursor-workspace",
         )
         self.assertEqual(inv.argv[:5], ("cursor-agent", "--print", "--mode=ask", "--output-format", "text"))
         self.assertIn("--model", inv.argv)
         self.assertNotIn("--force", inv.argv)
+        self.assertIn("--approve-mcps", inv.argv)
+        workspace = Path(inv.argv[inv.argv.index("--workspace") + 1])
+        self.assertEqual(workspace, (self.root / "cursor-workspace").resolve())
+        cursor_mcp = json.loads((workspace / ".cursor" / "mcp.json").read_text())
+        self.assertEqual(
+            cursor_mcp,
+            {"mcpServers": {research.EXA_MCP_NAME: {"url": research.EXA_MCP_URL}}},
+        )
 
     def test_opencode_invocation_enforces_global_and_agent_denials(self):
         existing = {
@@ -100,7 +113,24 @@ class ResearchTests(unittest.TestCase):
         for key in ("edit", "bash", "external_directory", "task"):
             self.assertEqual(cfg["permission"][key], "deny")
             self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "deny")
-        self.assertEqual(cfg["permission"]["websearch"], "allow")
+        for key in ("websearch", "webfetch"):
+            self.assertEqual(cfg["permission"][key], "allow")
+            self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "allow")
+        self.assertEqual(
+            cfg["mcp"],
+            {
+                research.EXA_MCP_NAME: {
+                    "type": "remote",
+                    "url": research.EXA_MCP_URL,
+                    "enabled": True,
+                    "oauth": False,
+                    "codemode": False,
+                }
+            },
+        )
+        for key in research.EXA_MCP_TOOLS:
+            self.assertEqual(cfg["permission"][key], "allow")
+            self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "allow")
         self.assertEqual(cfg["model"], "provider/model")
 
     def test_invalid_inline_opencode_config_fails_closed(self):
@@ -427,7 +457,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(disk2["tasks"]["a"]["status"], "failed")
         self.assertEqual(disk2["tasks"]["a"]["attempts"], [])
 
-    def test_opencode_overlay_preserves_restrictive_read_and_other_existing_denies(self):
+    def test_opencode_overlay_preserves_restrictive_read_and_restores_web_allow(self):
         existing = {
             "permission": {"read": "deny", "websearch": "deny", "edit": "allow"},
             "agent": {
@@ -439,12 +469,16 @@ class ResearchTests(unittest.TestCase):
         cfg = json.loads(research.opencode_config(json.dumps(existing)))
 
         self.assertEqual(cfg["permission"]["read"], "deny")
-        self.assertEqual(cfg["permission"]["websearch"], "deny")
+        self.assertEqual(cfg["permission"]["websearch"], "allow")
+        self.assertEqual(cfg["permission"]["webfetch"], "allow")
         self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"]["read"], "deny")
-        self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"]["webfetch"], "deny")
+        self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"]["webfetch"], "allow")
         for key in research.OPENCODE_DENY:
             self.assertEqual(cfg["permission"][key], "deny")
             self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "deny")
+        for key in research.OPENCODE_WEB_ALLOW:
+            self.assertEqual(cfg["permission"][key], "allow")
+            self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "allow")
 
     def test_selected_opencode_agent_is_closed_world_and_keeps_secret_denies(self):
         existing = {
@@ -468,7 +502,14 @@ class ResearchTests(unittest.TestCase):
 
         cfg = json.loads(research.opencode_config(json.dumps(existing)))
         perms = cfg["agent"][research.OPENCODE_AGENT]["permission"]
-        expected_keys = {"*", "read", *research.OPENCODE_ALLOW, *research.OPENCODE_DENY}
+        expected_keys = {
+            "*",
+            "read",
+            *research.OPENCODE_ALLOW,
+            *research.OPENCODE_WEB_ALLOW,
+            *research.EXA_MCP_TOOLS,
+            *research.OPENCODE_DENY,
+        }
         self.assertEqual(set(perms), expected_keys)
         self.assertEqual(perms["*"], "deny")
         self.assertNotIn("custom_mutate", perms)
@@ -476,7 +517,10 @@ class ResearchTests(unittest.TestCase):
         self.assertNotIn("custom_global_*", perms)
         for key in research.OPENCODE_DENY:
             self.assertEqual(perms[key], "deny")
-        self.assertEqual(perms["webfetch"], "deny")
+        self.assertEqual(perms["webfetch"], "allow")
+        self.assertEqual(perms["websearch"], "allow")
+        for key in research.EXA_MCP_TOOLS:
+            self.assertEqual(perms[key], "allow")
         self.assertIsInstance(perms["read"], dict)
         self.assertEqual(perms["read"]["*"], "allow")
         self.assertEqual(perms["read"]["*.env"], "deny")
@@ -496,6 +540,10 @@ class ResearchTests(unittest.TestCase):
                 self.assertEqual(perms["*"], "deny")
                 for key in ("read", *research.OPENCODE_ALLOW):
                     self.assertEqual(perms[key], "deny")
+                for key in research.EXA_MCP_TOOLS:
+                    self.assertEqual(perms[key], "deny")
+                for key in research.OPENCODE_WEB_ALLOW:
+                    self.assertEqual(perms[key], "allow")
                 for key in research.OPENCODE_DENY:
                     self.assertEqual(perms[key], "deny")
 

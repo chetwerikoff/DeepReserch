@@ -67,13 +67,26 @@ Research workers never write result files themselves. They return their answer o
 
 ### Cursor
 
-Cursor is invoked non-interactively with Ask mode:
+Cursor is invoked non-interactively with Ask mode and runner-owned Exa MCP configuration:
 
 ```text
-cursor-agent --print --mode=ask --output-format text <prompt>
+cursor-agent --print --mode=ask --output-format text --approve-mcps --workspace <runner-run-directory> <prompt>
 ```
 
-The runner never adds `--force` and never falls back to a write-capable Cursor mode. The executable can be overridden with `--cursor-command`.
+At launch, the runner writes `<runner-run-directory>/.cursor/mcp.json` with only the remote
+`exa` server (`https://mcp.exa.ai/mcp`) and points Cursor at that workspace. `--approve-mcps`
+is required for non-interactive MCP use, but Cursor documents it as approving **all** configured
+MCP servers; it has no per-server approval flag. Project-level config and `CURSOR_CONFIG_DIR`
+were tested as narrower alternatives: project config still merges global servers, and the
+environment variable is not a supported CLI configuration mechanism. Thus a clean host gets
+only runner-configured Exa, while a host with extra global MCPs (such as this verification host)
+will approve those too; the runner cannot scope that Cursor approval further.
+
+The runner never adds `--force`/`--yolo` and never falls back to a write-capable Cursor mode.
+Cursor CLI exposes its native `webSearchRequestQuery`/web fetch interaction but no mechanical
+deny configuration for those built-in web tools. Ask mode leaves those requests approval-gated
+(and the non-interactive runner rejects them), which is not equivalent to an explicit deny; this
+remains a documented Cursor security gap. The executable can be overridden with `--cursor-command`.
 
 ### OpenCode
 
@@ -83,6 +96,19 @@ OpenCode is invoked with `opencode run` and a runner-owned inline agent. `OPENCO
 - `bash`
 - `external_directory`
 - `task`
+
+The injected config defines only the remote Exa MCP server and allows its exact
+`exa_web_search_exa`/`exa_web_fetch_exa` tools at both permission layers. OpenCode's built-in
+`websearch` and `webfetch` tools remain allowed at both layers as a fallback when Exa is
+unavailable, errors, or returns insufficient results. Exa preference is a prompt-level quality
+policy, not a mechanical guarantee; the existing closed-world agent default and `read` rules
+denying `*.env`/`*.env.*` remain in force.
+
+Each host namespaces MCP tool names differently: the server publishes `web_search_exa`, OpenCode
+addresses it as `exa_web_search_exa`, and Cursor as `exa-web_search_exa`. `prompts/worker.md`
+therefore tells workers to match on the name suffix rather than on an exact identifier, so a
+worker does not mistake a namespacing difference for Exa being unavailable and fall back
+needlessly.
 
 The invocation selects that agent and does not attach to an arbitrary pre-existing `opencode serve` process. The executable can be overridden with `--opencode-command`.
 
