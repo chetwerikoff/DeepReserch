@@ -110,7 +110,9 @@ therefore tells workers to match on the name suffix rather than on an exact iden
 worker does not mistake a namespacing difference for Exa being unavailable and fall back
 needlessly.
 
-The invocation selects that agent and requests OpenCode's machine-readable `--format json` event stream; it does not attach to an arbitrary pre-existing `opencode serve` process. After a successful worker process, the runner extracts the session ID from those events and queries `opencode export <sessionID>`, requiring the exported session's `info.agent` to equal `deep-research-worker`. A missing, ambiguous, unexportable, or different agent is a task-local `opencode_agent_verification_failed:*` failure, so the result cannot be accepted or silently fall back to OpenCode's default agent; this is the strongest positive signal exposed by OpenCode 1.18.14, whose export record does not independently expose the complete effective tool-permission map. The check deliberately fails closed if this CLI/session-record contract changes. The executable can be overridden with `--opencode-command`.
+Before `opencode run` is allowed to start, the runner executes `opencode debug config` with the exact same executable and environment and validates the resolved effective configuration. Both the global and `deep-research-worker` permission layers must still deny `edit`, `bash`, `external_directory`, and `task`; the selected agent must exist in `primary` mode; and the enabled Exa remote MCP must resolve to the runner-owned URL. Missing, malformed, overridden, or permissive effective configuration returns `opencode_safe_mode_preflight_failed:*` and the worker process is never launched. The raw `debug config` output is deliberately not persisted because resolved provider/MCP configuration can contain credentials.
+
+The actual invocation requests OpenCode's machine-readable `--format json` event stream and does not attach to an arbitrary pre-existing `opencode serve` process. After a successful worker process, the runner applies a second independent check: it extracts the session ID from those events and queries `opencode export <sessionID>`, requiring the exported session's `info.agent` to equal `deep-research-worker`. A missing, ambiguous, unexportable, or different agent is a task-local `opencode_agent_verification_failed:*` failure, so the result cannot be accepted or silently attributed to OpenCode's default agent. Both checks fail closed if their respective CLI/session-record contracts change. The executable can be overridden with `--opencode-command`.
 
 These controls are mechanical. The worker prompt also says not to write, but prompt wording is not the security boundary.
 
@@ -191,7 +193,8 @@ PASS requires:
 
 - accepted parseable result;
 - raw attempt captured;
-- invocation selects `deep-research-worker` and injects runtime denies for `edit`, `bash`, `external_directory`, and `task`;
+- pre-run resolved config confirms the selected `deep-research-worker`, both permission-layer denies for `edit`, `bash`, `external_directory`, and `task`, and the runner-owned Exa MCP;
+- the post-run exported session confirms `deep-research-worker`;
 - repository status is unchanged.
 
 If OpenCode is unavailable or unauthenticated on the verification host, record that explicit skip; do not claim live verification.
