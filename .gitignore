@@ -1,2 +1,7 @@
 .git-unusable/
 runs/**
+
+# Running the test suite must not dirty the tree: the live-smoke criterion in
+# README.md asserts `git status --porcelain` is unchanged before and after.
+__pycache__/
+*.py[cod]
