@@ -13,6 +13,7 @@
 ```text
 runs/<session>/
   plan.json
+  candidates.json
   state.json
   raw/
   results/
@@ -21,11 +22,15 @@ runs/<session>/
   FINAL_REPORT.md
 ```
 
+`candidates.json` is manager-owned and appears only when the request uses open-set candidate discovery. `research.py` does not validate or interpret it.
+
 `runs/**` is ignored by Git.
 
 ## Manager workflow
 
-Follow `prompts/manager.md`. A minimal plan is:
+Follow `prompts/manager.md`. Closed user-supplied option sets are researched directly by default. Open/unknown candidate universes use coarse candidate discovery first, then an explicit `candidates.json` screening gate; only shortlisted candidates receive deep-research tasks. Discovery is bounded to at most one targeted follow-up round, and final recommendations must rely on accepted deep-research evidence.
+
+A minimal plan is:
 
 ```json
 {
