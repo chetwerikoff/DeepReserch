@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -381,6 +383,149 @@ class ResearchTests(unittest.TestCase):
             self.skipTest("symlink creation unavailable")
         with self.assertRaises(research.RunnerFatal):
             self.runner(SequenceExecutor([]))
+
+    def test_partial_raw_is_task_local_interrupted_unknown_and_sibling_continues(self):
+        p = research.validate_plan(plan("bad", "good"))
+        seeded = self.runner(SequenceExecutor([]))
+        seeded.admit(p)
+        attempt = seeded.start("bad", "primary-research", "opencode", None)
+        seeded.raw_path("bad", attempt["ordinal"]).write_text("{", encoding="utf-8")
+
+        resumed = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        summary = self.runner(resumed, max_workers=1).execute(p)
+
+        self.assertEqual(summary["tasks"]["bad"]["status"], "failed")
+        self.assertIn("interrupted_unknown", summary["tasks"]["bad"]["error"])
+        self.assertEqual(summary["tasks"]["good"]["status"], "completed")
+        self.assertEqual(len(resumed.invocations), 1)
+        state = json.loads((self.runs / "s1" / "state.json").read_text())
+        self.assertEqual(len(state["tasks"]["bad"]["attempts"]), 1)
+
+    def test_failed_state_write_does_not_leak_candidate_into_memory_or_later_state(self):
+        p = research.validate_plan(plan("a"))
+        runner = self.runner(SequenceExecutor([]))
+        runner.admit(p)
+        before = copy.deepcopy(runner.state)
+        real_atomic_json = research.atomic_json
+
+        def fail_state_write(path, value):
+            if path == runner.state_path:
+                raise OSError("injected state write failure")
+            return real_atomic_json(path, value)
+
+        with patch.object(research, "atomic_json", side_effect=fail_state_write):
+            with self.assertRaises(OSError):
+                runner.start("a", "primary-research", "opencode", None)
+
+        self.assertEqual(runner.state, before)
+        disk = json.loads(runner.state_path.read_text())
+        self.assertEqual(disk["tasks"]["a"]["status"], "pending")
+        self.assertEqual(disk["tasks"]["a"]["attempts"], [])
+
+        runner.fail("a", "later mutation")
+        disk2 = json.loads(runner.state_path.read_text())
+        self.assertEqual(disk2["tasks"]["a"]["status"], "failed")
+        self.assertEqual(disk2["tasks"]["a"]["attempts"], [])
+
+    def test_opencode_overlay_preserves_restrictive_read_and_other_existing_denies(self):
+        existing = {
+            "permission": {"read": "deny", "websearch": "deny", "edit": "allow"},
+            "agent": {
+                research.OPENCODE_AGENT: {
+                    "permission": {"read": "deny", "webfetch": "deny", "bash": "allow"}
+                }
+            },
+        }
+        cfg = json.loads(research.opencode_config(json.dumps(existing)))
+
+        self.assertEqual(cfg["permission"]["read"], "deny")
+        self.assertEqual(cfg["permission"]["websearch"], "deny")
+        self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"]["read"], "deny")
+        self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"]["webfetch"], "deny")
+        for key in research.OPENCODE_DENY:
+            self.assertEqual(cfg["permission"][key], "deny")
+            self.assertEqual(cfg["agent"][research.OPENCODE_AGENT]["permission"][key], "deny")
+
+    def test_selected_opencode_agent_is_closed_world_and_keeps_secret_denies(self):
+        existing = {
+            "permission": {
+                "custom_global_*": "allow",
+                "read": {"*.secret": "deny", "*.env": "allow"},
+                "websearch": "allow",
+            },
+            "agent": {
+                research.OPENCODE_AGENT: {
+                    "permission": {
+                        "custom_mutate": "allow",
+                        "mymcp_*": "allow",
+                        "bash": "allow",
+                        "read": {"private/**": "deny", "*.env.*": "allow"},
+                        "webfetch": "deny",
+                    }
+                }
+            },
+        }
+
+        cfg = json.loads(research.opencode_config(json.dumps(existing)))
+        perms = cfg["agent"][research.OPENCODE_AGENT]["permission"]
+        expected_keys = {"*", "read", *research.OPENCODE_ALLOW, *research.OPENCODE_DENY}
+        self.assertEqual(set(perms), expected_keys)
+        self.assertEqual(perms["*"], "deny")
+        self.assertNotIn("custom_mutate", perms)
+        self.assertNotIn("mymcp_*", perms)
+        self.assertNotIn("custom_global_*", perms)
+        for key in research.OPENCODE_DENY:
+            self.assertEqual(perms[key], "deny")
+        self.assertEqual(perms["webfetch"], "deny")
+        self.assertIsInstance(perms["read"], dict)
+        self.assertEqual(perms["read"]["*"], "allow")
+        self.assertEqual(perms["read"]["*.env"], "deny")
+        self.assertEqual(perms["read"]["*.env.*"], "deny")
+        self.assertEqual(perms["read"]["*.env.example"], "allow")
+        self.assertEqual(perms["read"]["*.secret"], "deny")
+        self.assertEqual(perms["read"]["private/**"], "deny")
+
+    def test_opencode_existing_scalar_deny_stays_fail_closed(self):
+        for existing in (
+            {"permission": "deny"},
+            {"agent": {research.OPENCODE_AGENT: {"permission": "deny"}}},
+        ):
+            with self.subTest(existing=existing):
+                cfg = json.loads(research.opencode_config(json.dumps(existing)))
+                perms = cfg["agent"][research.OPENCODE_AGENT]["permission"]
+                self.assertEqual(perms["*"], "deny")
+                for key in ("read", *research.OPENCODE_ALLOW):
+                    self.assertEqual(perms[key], "deny")
+                for key in research.OPENCODE_DENY:
+                    self.assertEqual(perms[key], "deny")
+
+    def test_completed_state_requires_valid_bound_result_on_resume(self):
+        for variant in ("missing", "corrupt", "fingerprint", "accepted_ordinal"):
+            with self.subTest(variant=variant):
+                session = f"s-{variant}"
+                first = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+                p = research.validate_plan(plan("a"))
+                self.runner(first, session=session).execute(p)
+                result_path = self.runs / session / "results" / "a.json"
+                state_path = self.runs / session / "state.json"
+
+                if variant == "missing":
+                    result_path.unlink()
+                elif variant == "corrupt":
+                    result_path.write_text("{", encoding="utf-8")
+                elif variant == "fingerprint":
+                    result = json.loads(result_path.read_text())
+                    result["task_definition_sha256"] = "0" * 64
+                    research.atomic_json(result_path, result)
+                else:
+                    state = json.loads(state_path.read_text())
+                    state["tasks"]["a"]["accepted_attempt_ordinal"] = 2
+                    research.atomic_json(state_path, state)
+
+                resumed = SequenceExecutor([])
+                with self.assertRaises(research.RunnerFatal):
+                    self.runner(resumed, session=session).execute(p)
+                self.assertEqual(resumed.invocations, [])
 
     def test_atomic_write_replaces_with_complete_json(self):
         path = self.root / "state.json"
