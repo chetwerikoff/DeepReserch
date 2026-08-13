@@ -104,6 +104,12 @@ unavailable, errors, or returns insufficient results. Exa preference is a prompt
 policy, not a mechanical guarantee; the existing closed-world agent default and `read` rules
 denying `*.env`/`*.env.*` remain in force.
 
+Each host namespaces MCP tool names differently: the server publishes `web_search_exa`, OpenCode
+addresses it as `exa_web_search_exa`, and Cursor as `exa-web_search_exa`. `prompts/worker.md`
+therefore tells workers to match on the name suffix rather than on an exact identifier, so a
+worker does not mistake a namespacing difference for Exa being unavailable and fall back
+needlessly.
+
 The invocation selects that agent and does not attach to an arbitrary pre-existing `opencode serve` process. The executable can be overridden with `--opencode-command`.
 
 These controls are mechanical. The worker prompt also says not to write, but prompt wording is not the security boundary.
