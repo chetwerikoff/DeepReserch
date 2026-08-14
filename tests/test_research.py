@@ -285,6 +285,89 @@ class ResearchTests(unittest.TestCase):
         with self.assertRaises(research.RunnerFatal):
             research.validate_plan(dup)
 
+    def test_plan_research_bounds_are_optional_object_allowlisted(self):
+        bounds = {
+            "task_budget": 12,
+            "follow_up_task_budget": 4,
+            "follow_up_discovery_rounds": 1,
+            "max_workers": 4,
+            "per_task_timeout_seconds": 300,
+            "backend_guidance": None,
+            "nested": {"manager_owned": [1, True, None]},
+        }
+        raw = plan("a")
+        raw["research_bounds"] = bounds
+        raw["unknown_root"] = {"must": "drop"}
+        validated = research.validate_plan(raw)
+        self.assertEqual(validated["research_bounds"], bounds)
+        self.assertIsNot(validated["research_bounds"], bounds)
+        self.assertNotIn("unknown_root", validated)
+
+        legacy = research.validate_plan(plan("legacy"))
+        self.assertNotIn("research_bounds", legacy)
+
+        invalid = plan("a")
+        invalid["research_bounds"] = []
+        with self.assertRaises(research.RunnerFatal):
+            research.validate_plan(invalid)
+
+    def test_research_bounds_survive_admission_resume_and_append(self):
+        bounds = {
+            "task_budget": 12,
+            "follow_up_task_budget": 4,
+            "follow_up_discovery_rounds": 1,
+            "max_workers": 4,
+            "per_task_timeout_seconds": 300,
+            "backend_guidance": None,
+        }
+        initial = plan("a")
+        initial["research_bounds"] = copy.deepcopy(bounds)
+        first = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        self.runner(first).execute(research.validate_plan(initial))
+
+        plan_path = self.runs / "s1" / "plan.json"
+        state_path = self.runs / "s1" / "state.json"
+        self.assertEqual(json.loads(plan_path.read_text())["research_bounds"], bounds)
+        initial_sha = json.loads(state_path.read_text())["tasks"]["a"]["task_definition_sha256"]
+
+        resumed = SequenceExecutor([])
+        self.runner(resumed).execute(research.validate_plan(initial))
+        self.assertEqual(resumed.invocations, [])
+        self.assertEqual(json.loads(plan_path.read_text())["research_bounds"], bounds)
+
+        revised_bounds = copy.deepcopy(bounds)
+        revised_bounds["follow_up_task_budget"] = 5
+        bounds_only_revision = plan("a")
+        bounds_only_revision["research_bounds"] = revised_bounds
+        bounds_only_resume = SequenceExecutor([])
+        self.runner(bounds_only_resume).execute(research.validate_plan(bounds_only_revision))
+        self.assertEqual(bounds_only_resume.invocations, [])
+        self.assertEqual(json.loads(plan_path.read_text())["research_bounds"], revised_bounds)
+        self.assertEqual(
+            json.loads(state_path.read_text())["tasks"]["a"]["task_definition_sha256"],
+            initial_sha,
+        )
+
+        appended = plan("a", "b")
+        appended["research_bounds"] = copy.deepcopy(revised_bounds)
+        second = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        summary = self.runner(second).execute(research.validate_plan(appended))
+        self.assertEqual(summary["counts"]["completed"], 2)
+        self.assertEqual(len(second.invocations), 1)
+        self.assertIn("research b", second.invocations[0].prompt)
+        self.assertEqual(json.loads(plan_path.read_text())["research_bounds"], revised_bounds)
+        self.assertEqual(
+            json.loads(state_path.read_text())["tasks"]["a"]["task_definition_sha256"],
+            initial_sha,
+        )
+
+    def test_legacy_plan_without_research_bounds_still_runs(self):
+        ex = SequenceExecutor([research.InvocationResult(VALID_FINDINGS, b"", 0)])
+        summary = self.runner(ex, session="legacy").execute(research.validate_plan(plan("a")))
+        self.assertEqual(summary["counts"]["completed"], 1)
+        durable = json.loads((self.runs / "legacy" / "plan.json").read_text())
+        self.assertNotIn("research_bounds", durable)
+
     def test_contained_path_rejects_escape(self):
         base = self.root / "safe"
         base.mkdir()
