@@ -2,7 +2,7 @@
 
 This file is the shared manager workflow for Claude Code and Codex.
 
-The manager owns user-intent interpretation, topic decomposition, query generation, plan creation, candidate discovery and screening, gap/contradiction detection, true source-independence judgment, evidence-to-insight mapping, synthesis, bounded follow-up decisions, and the final report. `research.py` owns only deterministic execution and mechanical validation; do not move research strategy into the runner.
+The manager owns user-intent interpretation, topic decomposition, query generation, plan creation, candidate discovery and screening, gap/contradiction detection, true source-independence judgment, evidence-to-insight mapping, synthesis, bounded follow-up decisions, research-budget ownership, and the final report/stop decision. `research.py` owns only deterministic execution and mechanical validation; do not move research strategy into the runner.
 
 ## Choose the research path
 
@@ -31,20 +31,27 @@ Create or update `runs/<session>/plan.json`:
     {
       "id": "architecture",
       "title": "Architecture",
-      "objective": "...",
+      "objective": "Task mode: deep-research\nFind primary-source evidence about the architecture",
       "queries": ["...", "..."]
     }
   ]
 }
 ```
 
+Keep the existing task schema unchanged. Every manager-authored task `objective` must begin with **exactly one** explicit first-line mode marker:
+
+- `Task mode: candidate-discovery`
+- `Task mode: deep-research`
+
+Do not encode both markers and do not ask workers to infer the mode from prose. Use `candidate-discovery` only for coarse discovery tasks. Use `deep-research` for direct closed-set research, shortlist research, and manager-authored evidence-gap/contradiction follow-up tasks that are not candidate discovery.
+
 `research_bounds` is manager-owned metadata and must contain the actual selected values before the first execution, not labels such as `"request-specific"` or `"optional"`. `task_budget` caps all task IDs admitted during the run; `follow_up_task_budget` is the subset available for tasks appended after the first execution. For open-set work, `follow_up_discovery_rounds` must be at most `1`; for a closed-set comparison it is `0` unless the user explicitly broadens discovery. `backend_guidance` is either a concrete backend-supported limit/guidance object or `null` when the selected backend cannot honor such a limit. Treat these recorded bounds as immutable for the run; a materially changed scope should use a new session rather than silently rewriting the budget after spend.
 
 Task IDs must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` and be unique. Once a task ID has been admitted to durable state, later plan revisions are append-only. Once any attempt exists for an ID, its `id`, `title`, `objective`, and ordered `queries` are immutable. Changed research uses a new task ID.
 
-For direct closed-set work, create the narrow research tasks needed for the supplied options and continue to **Execute**.
+For direct closed-set work, create the narrow research tasks needed for the supplied options, mark each objective `Task mode: deep-research`, and continue to **Execute**.
 
-For open-set work, the initial plan contains **discovery tasks only**. Discovery is high-recall enumeration, not final recommendation or full comparison.
+For open-set work, the initial plan contains **discovery tasks only**. Mark each objective `Task mode: candidate-discovery`. Discovery is high-recall enumeration, not final recommendation or full comparison.
 
 ### Scope for open-set discovery
 
@@ -69,7 +76,7 @@ Problem/user language and product/category language may be combined when that is
 
 Popularity metadata is never an admission gate. Stars, forks, topics, implementation language, release count, and similar metadata may inform later maturity analysis, but must not prevent a materially relevant candidate from reaching screening.
 
-Discovery workers should return one candidate-backed finding per material candidate using the existing finding contract. Do not spend discovery budget on full architecture, maturity, license, or recommendation analysis.
+Discovery workers should return one candidate-backed finding per material candidate using the existing finding contract. Do not spend discovery budget on full architecture, maturity, license, or recommendation analysis. Candidate-discovery tasks remain coarse and do not receive worker-local adaptive deep follow-up.
 
 ## Execute
 
@@ -152,7 +159,9 @@ The screening gate is complete only when each material discovered candidate has 
 
 ## Deep research the shortlist
 
-Only after the screening gate, append new unique task IDs to `plan.json` for shortlisted candidates or sensible shortlist groups. Deep-research tasks may investigate capabilities, architecture, limitations, maturity/activity, license, primary evidence, differences from the user's target, and transferable ideas.
+Only after the screening gate, append new unique task IDs to `plan.json` for shortlisted candidates or sensible shortlist groups. Mark every such objective `Task mode: deep-research`. Deep-research tasks may investigate capabilities, architecture, limitations, maturity/activity, license, primary evidence, differences from the user's target, and transferable ideas.
+
+A deep-research worker must execute the manager-authored supplied queries first. Its worker policy may then allow zero or one task-local, evidence-triggered adaptive follow-up round inside the same objective: one material lead, at most two tightly related derived search queries, plus evidence fetches, then stop. This is per research invocation/attempt; retry/fallback remains unchanged and starts a fresh bounded attempt. The worker-local rule is not a persisted logical-task counter, does not consume or create manager task IDs by itself, and does not transfer global gap analysis or stop authority to the worker.
 
 Do not deeply research every discovery result merely because it was found. Run `research.py` and inspect accepted deep-research results before gap analysis or synthesis.
 
@@ -172,11 +181,11 @@ For open-set work, perform one post-shortlist gap check. Check whether:
 
 This is a bounded recipe, not a recursive discovery engine.
 
-If a material gap exists, append **at most one targeted follow-up discovery round** using new task IDs and run it. Then:
+If a material gap exists, append **at most one targeted follow-up discovery round** using new task IDs whose objectives are marked `Task mode: candidate-discovery`, and run it. Then:
 
 1. update `candidates.json` with every newly discovered material candidate and accepted-finding provenance;
 2. screen new candidates using the same criteria, unless the user's scope itself changed and the criteria are explicitly updated;
-3. append any newly justified deep-research tasks for newly shortlisted candidates;
+3. append any newly justified deep-research tasks for newly shortlisted candidates, with objectives marked `Task mode: deep-research`;
 4. if such deep-research tasks were appended, run `research.py` again and inspect their accepted results before synthesis.
 
 Automatic discovery has exactly two valid terminal outcomes:
@@ -186,7 +195,9 @@ Automatic discovery has exactly two valid terminal outcomes:
 
 Never start a second automatic discovery round merely to prove completeness.
 
-For direct closed-set work, targeted follow-up research may still be appended for evidence gaps or contradictions, but it must remain within the request-specific task/time budget and must not turn into broad candidate discovery unless the user asked for it.
+For direct closed-set work, targeted follow-up research may still be appended for evidence gaps or contradictions, but it must use new manager-authored task IDs marked `Task mode: deep-research`, remain within the request-specific task/time budget, and must not turn into broad candidate discovery unless the user asked for it.
+
+A worker-local adaptive follow-up does not replace this manager-owned gap check. If a material gap remains after a worker has used its single local adaptive round, only the manager may decide to append another deliberate task, subject to the recorded `research_bounds`. Workers never create those tasks or decide that the run is globally complete.
 
 ## Synthesis, evidence gate, and metrics
 
@@ -233,4 +244,4 @@ Finally write `runs/<session>/FINAL_REPORT.md`. For open-set discovery, include 
 
 Recommendations and detailed comparisons must use accepted deep-research evidence, not discovery-only snippets. A candidate first found in follow-up discovery may appear in a recommendation or detailed comparison only after any required deep-research task for that candidate/group has executed and its accepted result has been inspected.
 
-The manager, not Python and not a research worker, owns the final prose and the bounded decision to stop.
+The manager, not Python and not a research worker, owns the final prose, cross-task gap analysis, research budget, and the bounded decision to continue or stop.
