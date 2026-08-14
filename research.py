@@ -140,7 +140,11 @@ def validate_plan(value: Any) -> dict[str, Any]:
         if not isinstance(queries, list) or not queries or any(not isinstance(q, str) or not q.strip() for q in queries):
             raise RunnerFatal(f"{tid}: queries must be a non-empty array of non-empty strings")
         tasks.append({"id": tid, "title": title, "objective": objective, "queries": list(queries)})
-    return {"topic": value["topic"], "tasks": tasks}
+    plan = {"topic": value["topic"], "tasks": tasks}
+    if "research_bounds" in value:
+        if not isinstance(value["research_bounds"], dict): raise RunnerFatal("plan.research_bounds must be an object")
+        plan["research_bounds"] = copy.deepcopy(value["research_bounds"])
+    return plan
 
 
 def validate_findings(value: Any) -> list[dict[str, Any]]:
