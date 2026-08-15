@@ -74,6 +74,13 @@ class ResearchTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_candidate_discovery_contract_forbids_derived_searches(self):
+        contract = self.worker.read_text(encoding="utf-8")
+        self.assertIn("Candidate-discovery has a **zero derived-search budget**", contract)
+        self.assertIn("do not create or issue any additional search query", contract)
+        self.assertIn("regardless of whether you describe it as adaptive follow-up", contract)
+        self.assertIn("return candidate-backed findings, and stop", contract)
+
     def fake_opencode(self):
         path = self.root / "fake-opencode.py"
         path.write_text(
