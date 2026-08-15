@@ -78,7 +78,7 @@ Problem/user language and product/category language may be combined when that is
 
 Popularity metadata is never an admission gate. Stars, forks, topics, implementation language, release count, and similar metadata may inform later maturity analysis, but must not prevent a materially relevant candidate from reaching screening.
 
-Discovery workers should return one candidate-backed finding per material candidate using the existing finding contract. Do not spend discovery budget on full architecture, maturity, license, or recommendation analysis. Candidate-discovery tasks remain coarse and do not receive worker-local adaptive deep follow-up.
+Discovery workers should return one candidate-backed finding per material candidate using the existing finding contract. Do not spend discovery budget on full architecture, maturity, license, or recommendation analysis. Candidate-discovery tasks remain coarse, but may return one bounded opportunistic enrichment around a promising candidate or material lead. Accept that enrichment as already-paid evidence, not as a new discovery route, manager task, or recursive follow-up round.
 
 ## Execute
 
@@ -162,6 +162,8 @@ The screening gate is complete only when each material discovered candidate has 
 ## Deep research the shortlist
 
 Only after the screening gate, append new unique task IDs to `plan.json` for shortlisted candidates or sensible shortlist groups. Mark every such objective `Task mode: deep-research`. Deep-research tasks may investigate capabilities, architecture, limitations, maturity/activity, license, primary evidence, differences from the user's target, and transferable ideas.
+
+Before adding deep-research tasks, inspect accepted discovery evidence, including any opportunistic enrichment. Do not repeat research already adequately covered there. Create deep-research tasks only for remaining architecture, activity, license, limitation, comparison, or evidence gaps. Opportunistic evidence neither shortlists nor recommends a candidate and does not prove discovery breadth or saturation; it substitutes for later deep research only where it already answers the same question.
 
 A deep-research worker must execute the manager-authored supplied queries first. Its worker policy may then allow zero or one task-local, evidence-triggered adaptive follow-up round inside the same objective: one material lead, at most two tightly related derived search queries, plus evidence fetches, then stop. This is per research invocation/attempt; retry/fallback remains unchanged and starts a fresh bounded attempt. The worker-local rule is not a persisted logical-task counter, does not consume or create manager task IDs by itself, and does not transfer global gap analysis or stop authority to the worker.
 

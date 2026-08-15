@@ -74,12 +74,17 @@ class ResearchTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_candidate_discovery_contract_forbids_derived_searches(self):
-        contract = self.worker.read_text(encoding="utf-8")
-        self.assertIn("Candidate-discovery has a **zero derived-search budget**", contract)
-        self.assertIn("do not create or issue any additional search query", contract)
-        self.assertIn("regardless of whether you describe it as adaptive follow-up", contract)
-        self.assertIn("return candidate-backed findings, and stop", contract)
+    def test_candidate_discovery_contract_reuses_opportunistic_enrichment(self):
+        worker_contract = self.worker.read_text(encoding="utf-8")
+        manager_contract = (ROOT / "prompts" / "manager.md").read_text(encoding="utf-8")
+
+        self.assertIn("execute all manager-authored supplied queries before any derived query", worker_contract)
+        self.assertIn("zero or one opportunistic enrichment", worker_contract)
+        self.assertIn("one promising candidate or material lead", worker_contract)
+        self.assertIn("at most **two tightly related derived search queries**", worker_contract)
+        self.assertIn("cannot trigger another enrichment round", worker_contract)
+        self.assertIn("Do not repeat research already adequately covered", manager_contract)
+        self.assertIn("it substitutes for later deep research", manager_contract)
 
     def fake_opencode(self):
         path = self.root / "fake-opencode.py"
