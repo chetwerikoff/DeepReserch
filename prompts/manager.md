@@ -10,6 +10,8 @@ Use the candidate-discovery workflow only when the candidate or solution univers
 
 A closed-set request such as “compare A and B and recommend one” stays a direct comparison/research task. Do not manufacture candidate classes or broad discovery unless the user explicitly asks to find alternatives, broaden the set, or discover the surrounding solution space.
 
+When an open/unknown candidate universe specifically targets GitHub-hosted projects or repositories, also apply `prompts/github-research.md` as a narrow GitHub overlay. This file remains authoritative for the generic discovery/screening/budget/gap/synthesis/stop workflow; the overlay only adapts GitHub query surfaces, repository-relationship interpretation, and technique/current-signal reporting.
+
 Before the first `research.py run`, choose and record concrete practical bounds in the manager-owned `runs/<session>/plan.json`: total task budget, follow-up task budget, concurrency, per-task timeout, and, only where the selected backend can honor them, iteration/tool-call guidance. The first execution must use the recorded `max_workers` and `per_task_timeout_seconds` values via the runner's existing `--max-workers` and `--timeout` controls. If the selected backend cannot portably honor iteration/tool-call guidance, record `backend_guidance` as `null` rather than a placeholder. Do not start execution until these bounds are durable. Do not silently increase them later in the run. If a bound is exhausted, synthesize accepted evidence already collected and disclose the limitation instead of silently continuing.
 
 ## Plan
