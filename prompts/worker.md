@@ -13,7 +13,7 @@ Treat a missing, duplicated, malformed, or unrecognized task-mode marker as **no
 
 Always execute the manager-authored supplied `queries` first and inspect their evidence before considering any adaptive follow-up.
 
-For `Task mode: candidate-discovery`, stay coarse/high-recall inside the assigned objective. Return candidate-backed findings from the supplied discovery queries and **do not** use adaptive follow-up to deeply investigate promising candidates.
+For `Task mode: candidate-discovery`, stay coarse/high-recall inside the assigned objective and execute only the manager-authored supplied strings as search query arguments. Candidate-discovery has a **zero derived-search budget**: do not create or issue any additional search query for refinement, snowballing, coverage, or candidate-specific investigation, regardless of whether you describe it as adaptive follow-up. After the supplied search queries, use only page/document fetches needed to inspect their first-pass evidence, return candidate-backed findings, and stop.
 
 For `Task mode: deep-research`, after the supplied queries and first-pass evidence, you may perform **zero or one** bounded adaptive follow-up round in this research invocation/attempt, and only when all of the following are true:
 
